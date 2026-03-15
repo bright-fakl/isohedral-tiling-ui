@@ -1,0 +1,9 @@
+.git
+.github
+tests/
+*.pyc
+__pycache__/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+uv.lock
