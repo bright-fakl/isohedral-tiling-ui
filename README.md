@@ -12,6 +12,8 @@ license: mit
 
 Interactive Panel/Bokeh UI for designing isohedral tilings, powered by [carto-flow](https://github.com/bright-fakl/carto-flow).
 
+**Try it out:** https://devfakl-isohedral-tiling-ui.hf.space/
+
 ## Usage
 
 ```bash
