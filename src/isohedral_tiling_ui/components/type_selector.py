@@ -6,7 +6,7 @@ import math
 
 import panel as pn
 import param
-from isotile import find_types, get_type
+from isotile import find_types, get_type, list_presets
 
 NORMAL = {"border": "1px solid #eee", "background": "transparent"}
 SELECTED = {"border": "2px solid #1971c2", "background": "#e7f1fb"}
@@ -26,7 +26,7 @@ class TileTypeSelector(pn.viewable.Viewer):
         self._grid = pn.GridBox(ncols=6, nrows=0)
         self._buttons: dict[int, pn.widgets.ButtonIcon] = {}
         self._build_grid()
-        self.state.param.watch(self._mark_selected, "tiling_type")
+        self.state.param.watch(self._mark_selected, ["tiling_type", "source_label"])
 
     @param.depends("filter_vertices", "filter_params", "filter_customizable", watch=True)
     def _build_grid(self):
@@ -50,12 +50,13 @@ class TileTypeSelector(pn.viewable.Viewer):
         self._grid.objects = list(self._buttons.values())
 
     def _mark_selected(self, *events):
-        """Highlight the button of the current type and no other, whichever way the type was selected."""
+        """Highlight the button of the current type unless the design is a gallery preset (the gallery shows that)."""
         if self.state.tiling_type not in self._buttons:
             self._build_grid()  # the filters hide the current type; the grid keeps it
             return
+        from_gallery = self.state.source_label in list_presets()
         for number, button in self._buttons.items():
-            button.styles = SELECTED if number == self.state.tiling_type else NORMAL
+            button.styles = SELECTED if number == self.state.tiling_type and not from_gallery else NORMAL
 
     def _create_type_button(self, tiling_type: int, info: dict) -> pn.widgets.Button:
         """Create a clickable SVG button for a tiling type."""
@@ -97,6 +98,7 @@ class TileTypeSelector(pn.viewable.Viewer):
             on_click=lambda e, t=tiling_type: self._on_type_select(t),
             styles=NORMAL,
             align="center",
+            tags=[f"type:{tiling_type}"],
         )
 
         return btn

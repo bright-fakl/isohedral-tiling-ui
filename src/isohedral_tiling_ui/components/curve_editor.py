@@ -14,18 +14,35 @@ from isotile import interpolate
 from isohedral_tiling_ui.editor_model import editable, preset_availability
 from isohedral_tiling_ui.utils.curve_presets import get_curve_preset, list_curve_presets
 
+SELECTED_FILL, SELECTED_LINE = "crimson", "#7a0000"
+NODE_FILL, NODE_LINE = "#444", "#111"
+FIXED_FILL, FIXED_LINE = "#ccc", "#999"
+MUTED_ALPHA = 0.3  # alpha of the movable nodes while one of them is selected
+
 
 class CurveEditor(pn.viewable.Viewer):
     """Edge curve editor with draggable control points."""
 
     state = param.ClassSelector(class_=param.Parameterized)
-    selected_point_idx = param.Integer(default=1)
 
     def __init__(self, **params):
         super().__init__(**params)
         self._cp_source = ColumnDataSource(
-            data={"x": [], "y": [], "idx": [], "editable": [], "fill_color": [], "line_color": [], "edge_shape": []}
+            data={
+                "x": [],
+                "y": [],
+                "idx": [],
+                "editable": [],
+                "fill_color": [],
+                "line_color": [],
+                "alpha": [],
+                "edge_shape": [],
+            }
         )
+        # Index (in the curve) of the selected movable node, -1 if none. Kept apart from the selection of the source,
+        # which PointDrawTool clears at the end of every drag.
+        self._selection_source = ColumnDataSource(data={"idx": [-1]})
+        self._selection_curve_id: int | None = None
         # Separate source for fixed (non-editable) points - not connected to PointDrawTool
         self._fixed_cp_source = ColumnDataSource(data={"x": [], "y": [], "idx": [], "fill_color": [], "line_color": []})
         self._curve_source = ColumnDataSource(data={"x": [], "y": []})
@@ -34,6 +51,9 @@ class CurveEditor(pn.viewable.Viewer):
         self._programmatic_cp_update = False  # Flag to skip history push on programmatic cp_source writes
         self._y_scale = 1.0  # Y-axis scale factor (default ±1)
         self._preset_buttons: dict[str, pn.widgets.ButtonIcon] = {}
+        # name -> reason a preset is unavailable ("" if available). Not the ``disabled`` property: the browser model of
+        # a ButtonIcon sets it to true on click and to false 75 ms later, which overwrites the value set here.
+        self._preset_reasons: dict[str, str] = {}
         self._preset_grid = self._build_preset_buttons()
         self._figure = self._build_figure()
         self._setup_callbacks()
@@ -108,7 +128,12 @@ class CurveEditor(pn.viewable.Viewer):
             size=10,
             fill_color="fill_color",
             line_color="line_color",
+            fill_alpha="alpha",
+            line_alpha="alpha",
         )
+        # the node colors come from the columns, not from the selection of the source
+        self._cp_renderer.selection_glyph = None
+        self._cp_renderer.nonselection_glyph = None
 
         # Add text labels for editable control points
         from bokeh.models import LabelSet
@@ -136,6 +161,7 @@ class CurveEditor(pn.viewable.Viewer):
         p.toolbar.active_tap = draw
 
         p.on_event(DoubleTap, self._on_double_tap)
+        self._add_selection_callbacks(p)
 
         # Use pan event for live feedback during drag
         # Pan fires continuously during drag operations
@@ -260,6 +286,72 @@ class CurveEditor(pn.viewable.Viewer):
 
         return p
 
+    def _add_selection_callbacks(self, p) -> None:
+        """Select a node by clicking or dragging it, deselect by clicking elsewhere; the selection survives drags.
+
+        The selected node is highlighted and the other movable nodes are muted. PointDrawTool selects the node under
+        the pointer and clears that selection when a drag ends, so the choice is copied to ``_selection_source``.
+        """
+        args = {
+            "cp_source": self._cp_source,
+            "sel_source": self._selection_source,
+            "style": {
+                "fill": SELECTED_FILL,
+                "line": SELECTED_LINE,
+                "node_fill": NODE_FILL,
+                "node_line": NODE_LINE,
+                "muted": MUTED_ALPHA,
+            },
+        }
+        recolor = """
+        const cur = sel_source.data.idx[0];
+        const d = cp_source.data;
+        for (let i = 0; i < d.idx.length; i++) {
+            const on = d.idx[i] === cur;
+            d.fill_color[i] = on ? style.fill : style.node_fill;
+            d.line_color[i] = on ? style.line : style.node_line;
+            d.alpha[i] = (cur < 0 || on) ? 1 : style.muted;
+        }
+        cp_source.change.emit();
+        """
+        on_indices = CustomJS(
+            args=args,
+            code="""
+            if (cp_source._panning && cp_source.selected.indices.length === 0) return;  // the end of a drag
+            const k = cp_source.selected.indices;
+            const sel = k.length ? cp_source.data.idx[k[0]] : -1;
+            if (sel_source.data.idx[0] === sel) return;
+            sel_source.data = {idx: [sel]};
+            """
+            + recolor,
+        )
+        self._cp_source.selected.js_on_change("indices", on_indices)
+        p.js_on_event("panstart", CustomJS(args={"cp_source": self._cp_source}, code="cp_source._panning = true;"))
+        p.js_on_event(
+            "panend",
+            CustomJS(
+                args={"cp_source": self._cp_source},
+                code="setTimeout(() => { cp_source._panning = false; }, 0);",
+            ),
+        )
+        # a click on empty space leaves the source without selection, a click on a node leaves it selected
+        p.js_on_event(
+            "tap",
+            CustomJS(
+                args=args,
+                code="""
+                setTimeout(() => {
+                    if (cp_source.selected.indices.length === 0 && sel_source.data.idx[0] !== -1) {
+                        sel_source.data = {idx: [-1]};
+                        """
+                + recolor
+                + """
+                    }
+                }, 0);
+                """,
+            ),
+        )
+
     def _setup_callbacks(self):
         """Set up callbacks for drag and selection."""
         # Only use Python callback - JS pan event handles live feedback during drag
@@ -280,46 +372,32 @@ class CurveEditor(pn.viewable.Viewer):
         n = len(curve)
         edge_shape = self.state.shape_type(curve_id)
 
-        # Separate editable and fixed points
-        editable_x = []
-        editable_y = []
-        editable_idx = []
-        editable_fill_color = []
-        editable_line_color = []
+        # Keep the selection while the curve keeps the node
+        selected = self._selection_source.data["idx"][0]
+        if curve_id != self._selection_curve_id or selected >= n or not editable(edge_shape, n, selected):
+            selected = -1
+        self._selection_curve_id = curve_id
+        if self._selection_source.data["idx"][0] != selected:
+            self._selection_source.data = {"idx": [selected]}
 
-        fixed_x = []
-        fixed_y = []
-        fixed_idx = []
-        fixed_fill_color = []
-        fixed_line_color = []
+        # Separate editable and fixed points
+        editable_x, editable_y, editable_idx = [], [], []
+        editable_fill_color, editable_line_color, editable_alpha = [], [], []
+        fixed_x, fixed_y, fixed_idx = [], [], []
 
         for i in range(n):
-            is_editable = editable(edge_shape, n, i)
-
-            # Determine color
-            if i == self.selected_point_idx:
-                fill = "crimson"
-                line = "#7a0000"
-            elif not is_editable:
-                # Non-editable points (endpoints, S midpoint, mirrored points)
-                fill = "#ccc"
-                line = "#999"
-            else:
-                fill = "#444"
-                line = "#111"
-
-            if is_editable:
+            if editable(edge_shape, n, i):
                 editable_x.append(curve[i][0])
                 editable_y.append(curve[i][1])
                 editable_idx.append(i)
-                editable_fill_color.append(fill)
-                editable_line_color.append(line)
+                is_selected = i == selected
+                editable_fill_color.append(SELECTED_FILL if is_selected else NODE_FILL)
+                editable_line_color.append(SELECTED_LINE if is_selected else NODE_LINE)
+                editable_alpha.append(1.0 if is_selected or selected < 0 else MUTED_ALPHA)
             else:
                 fixed_x.append(curve[i][0])
                 fixed_y.append(curve[i][1])
                 fixed_idx.append(i)
-                fixed_fill_color.append(fill)
-                fixed_line_color.append(line)
 
         # Update editable and fixed points sources.
         # Wrap in _programmatic_cp_update so _on_curve_change skips history push.
@@ -333,14 +411,15 @@ class CurveEditor(pn.viewable.Viewer):
                 "editable": [True] * len(editable_x),
                 "fill_color": editable_fill_color,
                 "line_color": editable_line_color,
+                "alpha": editable_alpha,
                 "edge_shape": [edge_shape] * len(editable_x),
             }
             self._fixed_cp_source.data = {
                 "x": fixed_x,
                 "y": fixed_y,
                 "idx": fixed_idx,
-                "fill_color": fixed_fill_color,
-                "line_color": fixed_line_color,
+                "fill_color": [FIXED_FILL] * len(fixed_x),
+                "line_color": [FIXED_LINE] * len(fixed_x),
             }
         finally:
             self._programmatic_cp_update = False
@@ -471,13 +550,15 @@ class CurveEditor(pn.viewable.Viewer):
             "x": [curve[i][0] for i in fixed],
             "y": [curve[i][1] for i in fixed],
             "idx": fixed,
-            "fill_color": ["#ccc"] * len(fixed),
-            "line_color": ["#999"] * len(fixed),
+            "fill_color": [FIXED_FILL] * len(fixed),
+            "line_color": [FIXED_LINE] * len(fixed),
         }
 
     def _apply_preset(self, preset_name: str):
         curve_id = self.state.active_curve_id
         if curve_id is None:
+            return
+        if self._preset_reasons.get(preset_name):
             return
         preset_label = preset_name.replace("_", " ")
         self.state.set_curve(curve_id, get_curve_preset(preset_name), f"Apply '{preset_label}' to curve {curve_id}")
@@ -700,6 +781,7 @@ class CurveEditor(pn.viewable.Viewer):
                 description=desc,
                 on_click=lambda e, n=name: self._apply_preset(n),
                 size="24px",
+                tags=[f"preset:{name}"],
             )
             self._preset_buttons[name] = btn
             self._preset_descriptions[name] = desc
@@ -710,7 +792,7 @@ class CurveEditor(pn.viewable.Viewer):
 
     @param.depends("state.draft", "state.active_curve_id", watch=True)
     def _refresh_presets(self):
-        """Disable the presets that cannot be applied to the selected curve and say why in the tooltip."""
+        """Mute the presets that cannot be applied to the selected curve and say why in the tooltip."""
         curve_id = self.state.active_curve_id
         if not self._preset_buttons or curve_id is None:
             return
@@ -718,7 +800,7 @@ class CurveEditor(pn.viewable.Viewer):
         for name, button in self._preset_buttons.items():
             reason = status[name]
             description = self._preset_descriptions[name]
-            button.disabled = bool(reason)
+            self._preset_reasons[name] = reason
             button.description = f"{description}. Not available: {reason}" if reason else description
             button.styles = {"opacity": "0.35"} if reason else {}
 

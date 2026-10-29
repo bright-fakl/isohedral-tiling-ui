@@ -61,3 +61,20 @@ jobs:
           uv pip install -e . --group dev -c ci/constraints.txt
       - name: pytest
         run: uv run --no-sync pytest -q
+
+  browser:
+    name: browser tests (Chromium)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.17"
+      - name: Install
+        run: |
+          uv venv --python 3.12
+          uv pip install -e . --group dev -c ci/constraints.txt
+          uv pip install playwright
+          uv run --no-sync playwright install --with-deps chromium
+      - name: pytest (browser)
+        run: uv run --no-sync pytest -q tests/browser

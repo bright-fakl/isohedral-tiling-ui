@@ -24,7 +24,7 @@ from isohedral_tiling_ui.components import (
     PrototileEditor,
     TileTypeSelector,
 )
-from isohedral_tiling_ui.editor_model import Draft, parameter_groups
+from isohedral_tiling_ui.editor_model import Draft, parameter_groups, preset_availability
 from isohedral_tiling_ui.state import TilingState
 
 SRC = Path(__file__).parent.parent / "src" / "isohedral_tiling_ui"
@@ -349,29 +349,68 @@ def click(button) -> None:
     button.clicks += 1
 
 
-def test_preset_buttons_are_disabled_with_a_reason_where_the_preset_cannot_apply(state):
+def unavailable(editor: CurveEditor) -> set[str]:
+    """Names of the preset buttons shown as unavailable (muted, with the reason in the tooltip)."""
+    return {n for n, reason in editor._preset_reasons.items() if reason}
+
+
+def test_preset_buttons_are_unavailable_with_a_reason_where_the_preset_cannot_apply(state):
     editor = CurveEditor(state=state)
     state.load_type(36)
     buttons = editor._preset_buttons
-    assert buttons["scalloped"].disabled is False
-    assert buttons["scalloped_deep"].disabled is True
+    assert {"scalloped_deep", "straight"} <= unavailable(editor)
+    assert "scalloped" not in unavailable(editor)
     assert "Not available: the prototile would be invalid" in buttons["scalloped_deep"].description
-    assert buttons["straight"].disabled is True  # already the current curve
+    assert "already the current curve" in buttons["straight"].description
     assert "Not available" not in buttons["scalloped"].description
+    assert buttons["scalloped_deep"].styles == {"opacity": "0.35"}
+    assert buttons["scalloped"].styles == {}
 
 
-def test_preset_buttons_follow_the_draft(state):
+def test_buttons_are_never_disabled_through_the_disabled_property(state):
+    """The browser model of a ButtonIcon sets ``disabled`` itself on every click and resets it 75 ms later."""
     editor = CurveEditor(state=state)
     state.load_type(36)
     click(editor._preset_buttons["scalloped"])
-    assert editor._preset_buttons["scalloped"].disabled  # now the current curve
-    assert not editor._preset_buttons["straight"].disabled
+    assert not any(b.disabled for b in editor._preset_buttons.values())
+
+
+def test_preset_availability_follows_the_draft_after_every_change(state):
+    editor = CurveEditor(state=state)
+    state.load_type(36)
+    expected = unavailable(editor)
+    assert "straight" in expected
+    click(editor._preset_buttons["scalloped"])
+    assert "scalloped" in unavailable(editor)  # now the current curve
+    assert "straight" not in unavailable(editor)  # enabled again
+    click(editor._preset_buttons["straight"])
+    assert "straight" in unavailable(editor)
+    assert "scalloped" not in unavailable(editor)  # enabled again after another preset was clicked
     state.undo()
-    assert not editor._preset_buttons["scalloped"].disabled
-    assert editor._preset_buttons["straight"].disabled
+    assert "scalloped" in unavailable(editor) and "straight" not in unavailable(editor)
+    state.redo()
+    assert "straight" in unavailable(editor) and "scalloped" not in unavailable(editor)
+    state.reset()
+    assert unavailable(editor) == expected
+    state.load_type(36)
+    assert unavailable(editor) == expected
+    state.load_preset("wavy_triangle")
+    for curve_id in state.type_info["customizable_shape_ids"]:  # selecting another edge
+        state.active_curve_id = curve_id
+        status = preset_availability(state.draft, curve_id)
+        assert unavailable(editor) == {n for n, reason in status.items() if reason}
 
 
-def test_repeated_preset_clicks_keep_responding(state, notes):
+def test_unavailable_presets_are_not_applied(state):
+    editor = CurveEditor(state=state)
+    state.load_type(36)
+    n = len(state.model.labels)
+    click(editor._preset_buttons["scalloped_deep"])  # would make the prototile invalid
+    click(editor._preset_buttons["straight"])  # already the current curve
+    assert len(state.model.labels) == n
+
+
+def test_repeated_preset_clicks_keep_responding(state):
     editor = CurveEditor(state=state)
     state.load_type(36)
     buttons = editor._preset_buttons
@@ -381,17 +420,29 @@ def test_repeated_preset_clicks_keep_responding(state, notes):
     assert len(state.model.labels) == 2
     click(buttons["scalloped_down"])  # another one
     assert len(state.model.labels) == 3
-    # A preset that is refused (the widget is enabled when the state changed after the last refresh) is reported and
-    # the next click works.
-    buttons["scalloped_deep"].disabled = False
-    click(buttons["scalloped_deep"])
-    assert notes.levels() == ["error"]
-    assert "[0, 1]" in notes.events[0][1]
-    assert state.draft.curve(0) == state.draft.curve(0)
     click(buttons["scalloped"])
     assert len(state.model.labels) == 4
     click(buttons["scalloped_down"])
     assert len(state.model.labels) == 5
+
+
+def test_node_colors_are_uniform_and_the_selection_is_kept_by_the_editor(state):
+    editor = CurveEditor(state=state)
+    state.load_preset("puzzle_piece")
+    data = editor._cp_source.data
+    assert set(data["fill_color"]) == {"#444"} and set(data["alpha"]) == {1.0}  # no node is special
+    assert set(editor._fixed_cp_source.data["fill_color"]) == {"#ccc"}
+    node = data["idx"][1]
+    editor._selection_source.data = {"idx": [node]}  # what the browser sets when a node is selected
+    editor._update_figure()  # a redraw keeps the selection of a node that still exists
+    data = editor._cp_source.data
+    assert [(i, c, a) for i, c, a in zip(data["idx"], data["fill_color"], data["alpha"], strict=True)] == [
+        (i, "crimson" if i == node else "#444", 1.0 if i == node else 0.3) for i in data["idx"]
+    ]
+    other = next(c for c in state.type_info["customizable_shape_ids"] if c != state.active_curve_id)
+    state.active_curve_id = other  # another curve: no selection
+    assert editor._selection_source.data["idx"] == [-1]
+    assert set(editor._cp_source.data["alpha"]) == {1.0}
 
 
 def test_table_edit_is_applied_through_a_scheduled_callback(state, monkeypatch):
@@ -432,25 +483,39 @@ def selected_types(selector: TileTypeSelector) -> list[int]:
     return [n for n, b in selector._buttons.items() if b.styles.get("border", "").startswith("2px")]
 
 
-def test_exactly_the_current_type_is_marked_whichever_way_it_was_selected(state):
-    selector = TileTypeSelector(state=state)
-    assert selected_types(selector) == [10]
-    selector._buttons[41].clicks += 1  # a click on the button
-    assert state.tiling_type == 41
-    assert selected_types(selector) == [41]
-    state.load_preset("tree")  # the gallery
-    assert selected_types(selector) == [4]
-    state.load_data({"tiling_type": 84})  # a file
-    assert selected_types(selector) == [84]
-    state.set_parameters([0.4, 0.4])
+def selected_tiles(gallery: GalleryPanel) -> list[str]:
+    return [n for n, b in gallery._buttons.items() if b.styles.get("border", "").startswith("2px")]
+
+
+def test_gallery_marks_the_loaded_preset_and_the_type_panel_the_type_otherwise(state):
+    """Exactly one button is marked in the gallery and the type panel together: the source of the design."""
+    selector, gallery = TileTypeSelector(state=state), GalleryPanel(state=state)
+
+    def marked():
+        return selected_tiles(gallery), selected_types(selector)
+
+    assert marked() == (["regular_hexagon"], [])
+    selector._buttons[41].clicks += 1  # a click on the type button
+    assert marked() == ([], [41])
+    gallery._buttons["tree"].clicks += 1  # a click on a gallery tile
+    assert state.source_label == "tree"
+    assert marked() == (["tree"], [])
+    click(CurveEditor(state=state)._preset_buttons["scalloped"])  # an edit keeps the source
+    assert marked() == (["tree"], [])
     state.undo()
     state.redo()
     state.reset()
-    assert selected_types(selector) == [84]
+    assert marked() == (["tree"], [])
+    state.load_data({"tiling_type": 84})  # a file
+    assert marked() == ([], [84])
     state.load_type(93)
-    assert selected_types(selector) == [93]
-    selector.filter_vertices = "4"  # the grid is rebuilt; the current type stays in it and marked
-    assert selected_types(selector) == [93]
+    assert marked() == ([], [93])
+    state.load_preset("square")
+    assert marked() == (["square"], [])
+    selector.filter_vertices = "6"  # the type grid is rebuilt
+    assert marked() == (["square"], [])
+    state.load_type(93)
+    assert marked() == ([], [93])
     assert all(b.styles["background"] == "transparent" for n, b in selector._buttons.items() if n != 93)
 
 
