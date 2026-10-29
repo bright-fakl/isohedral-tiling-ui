@@ -1,0 +1,34 @@
+name: Weekly isotile main
+
+# Runs the tests against the head of isotile main instead of the pinned commit, to find API changes before the pin moves.
+# It only reports: a failure does not block or deploy anything.
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+env:
+  MPLBACKEND: Agg
+  ISOTILE_MAIN: https://github.com/bright-fakl/isotile/archive/refs/heads/main.zip
+
+jobs:
+  tests:
+    name: tests with isotile main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.17"
+      - name: Install with isotile main in place of the pin
+        run: |
+          uv venv --python 3.12
+          uv pip install -e . --group dev -c ci/constraints.txt
+          uv pip install --reinstall-package isotile "$ISOTILE_MAIN"
+          uv pip install playwright
+          uv run --no-sync playwright install --with-deps chromium
+          uv pip list | grep -i isotile
+      - name: pytest (headless)
+        run: uv run --no-sync pytest -q --ignore=tests/browser
+      - name: pytest (browser)
+        run: uv run --no-sync pytest -q tests/browser
