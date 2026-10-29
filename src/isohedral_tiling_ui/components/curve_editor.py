@@ -12,12 +12,14 @@ from bokeh.plotting import figure
 from isotile import interpolate
 
 from isohedral_tiling_ui.components.icon_button import icon_button
+from isohedral_tiling_ui.components.probe import ProbeChannel
 from isohedral_tiling_ui.editor_model import editable, preset_availability, preset_curve
 from isohedral_tiling_ui.utils.curve_presets import get_curve_preset, list_curve_presets
 
 SELECTED_FILL, SELECTED_LINE = "crimson", "#7a0000"
 NODE_FILL, NODE_LINE = "#444", "#111"
 FIXED_FILL, FIXED_LINE = "#ccc", "#999"
+INVALID_COLOR = "#d62728"  # the curve or edges that make the prototile invalid
 
 
 class CurveEditor(pn.viewable.Viewer):
@@ -56,6 +58,7 @@ class CurveEditor(pn.viewable.Viewer):
         # name -> reason a preset is unavailable ("" if available); the button is muted and a click is ignored
         self._preset_reasons: dict[str, str] = {}
         self._preset_grid = self._build_preset_buttons()
+        self._probe = ProbeChannel("curve", self._on_probe)
         self._figure = self._build_figure()
         self._plot_row = pn.Row(
             pn.pane.Bokeh(self._figure, height=210, sizing_mode="stretch_width"),
@@ -177,6 +180,7 @@ class CurveEditor(pn.viewable.Viewer):
                     "curve_source": self._curve_source,
                     "cp_source": self._cp_source,
                     "fixed_cp_source": self._fixed_cp_source,
+                    "probe_in": self._probe.in_source,
                 },
                 code="""
             const data = cp_source.data;
@@ -284,7 +288,8 @@ class CurveEditor(pn.viewable.Viewer):
             points.sort((a, b) => a.idx - b.idx);
 
             curve_source.data = {x: points.map(p => p.x), y: points.map(p => p.y)};
-        """,
+        """
+                + self._probe.send_js("{pts: points.map(p => [p.x, p.y])}"),
             ),
         )
 
@@ -353,7 +358,8 @@ class CurveEditor(pn.viewable.Viewer):
             "panend",
             CustomJS(
                 args={"cp_source": self._cp_source, "sel_source": self._selection_source},
-                code="""
+                code=self._probe.cancel_js
+                + """
                 setTimeout(() => {
                     cp_source._panning = false;
                     const chosen = sel_source.data.idx, d = cp_source.data;
@@ -457,6 +463,22 @@ class CurveEditor(pn.viewable.Viewer):
         self._cp_source.selected.indices = [k for k, i in enumerate(editable_idx) if i in kept]
 
         self._show_curve(curve_id, curve)
+
+    def _on_probe(self, payload: dict) -> None:
+        """A dragged curve from the browser: check it without committing and show the result."""
+        curve_id = self.state.active_curve_id
+        if curve_id is None or "pts" not in payload:
+            return
+        y_max = self._y_scale
+        points = [(x, max(-y_max, min(y_max, y))) for x, y in payload["pts"]]
+        self.state.probe_curve(curve_id, points)
+
+    @param.depends("state.validity", "state.active_curve_id", watch=True)
+    def _show_validity(self):
+        """The curve is red while the dragged or refused curve is invalid."""
+        validity = self.state.validity
+        bad = validity is not None and self.state.active_curve_id in validity.shape_ids
+        self._curve_renderer.glyph.line_color = INVALID_COLOR if bad else "steelblue"
 
     def _show_no_curve(self) -> None:
         """Empty the figure: no curve, no nodes, no selection."""

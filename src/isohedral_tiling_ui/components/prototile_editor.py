@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import panel as pn
 import param
-from bokeh.models import ColumnDataSource, CustomJS, LabelSet, PointDrawTool
+from bokeh.models import BooleanFilter, CDSView, ColumnDataSource, CustomJS, LabelSet, PointDrawTool
 from bokeh.plotting import figure
 
+from isohedral_tiling_ui.components.probe import ProbeChannel
 from isohedral_tiling_ui.editor_model import parameter_groups
+
+INVALID_COLOR = "#d62728"  # the edges that make the prototile invalid
+INVALID_TRACK = "rgba(214, 39, 40, 0.35)"  # the part of a slider track with invalid values
 
 
 class PrototileEditor(pn.viewable.Viewer):
@@ -32,6 +36,8 @@ class PrototileEditor(pn.viewable.Viewer):
         # Flag to prevent feedback loop between JS and Python callbacks
         self._in_drag = False
         self._primary_dragged = -1  # Track which vertex is being primarily dragged
+        self._probe = ProbeChannel("vertex", self._on_probe)
+        self._bad_filter = BooleanFilter(booleans=[])  # the edges of the shape ids that make the prototile invalid
         self._figure = self._build_figure()
         self._setup_callbacks()
         # Initialize with current state values since @param.depends doesn't fire on init
@@ -63,6 +69,14 @@ class PrototileEditor(pn.viewable.Viewer):
 
         # Edge lines (individual segments for labeling)
         p.multi_line("xs", "ys", source=self._edge_source, line_color="line_color", line_width=1.5)
+        p.multi_line(
+            "xs",
+            "ys",
+            source=self._edge_source,
+            view=CDSView(filter=self._bad_filter),
+            line_color=INVALID_COLOR,
+            line_width=3.5,
+        )
 
         # Fixed vertices (no tool attached - not draggable)
         p.scatter(
@@ -178,6 +192,7 @@ class PrototileEditor(pn.viewable.Viewer):
                 "group_vertices": ["[]"],
                 "orig_x": ["[]"],
                 "orig_y": ["[]"],
+                "values": ["{}"],
             }
         )
 
@@ -231,6 +246,7 @@ class PrototileEditor(pn.viewable.Viewer):
                     "edge_source": self._edge_source,
                     "edge_labels": self._edge_label_source,
                     "jacobian_source": self._jacobian_source,
+                    "probe_in": self._probe.in_source,
                     "drag_state": self._drag_state_source,
                     "fig": self._figure,
                     "snap_h_span": self._snap_h_span,
@@ -254,12 +270,14 @@ class PrototileEditor(pn.viewable.Viewer):
             let vertices = [];
             let orig_x = [];
             let orig_y = [];
+            let pvals = {};
             try {
                 jac = JSON.parse(jacobian_source.data.jacobian[0]);
                 params = JSON.parse(jacobian_source.data.group_params[0]);
                 vertices = JSON.parse(jacobian_source.data.group_vertices[0]);
                 orig_x = JSON.parse(jacobian_source.data.orig_x[0]);
                 orig_y = JSON.parse(jacobian_source.data.orig_y[0]);
+                pvals = JSON.parse(jacobian_source.data.values[0]);
             } catch (e) {}
 
             // Compute displacements from the true pre-drag vertex positions stored in
@@ -420,6 +438,16 @@ class PrototileEditor(pn.viewable.Viewer):
                     if (Math.abs(aug[i][i]) > 1e-12) dp[i] /= aug[i][i];
                 }
 
+                // A parameter stays in 0 to 1, the range of the sliders. The values inside the range at which the
+                // prototile is invalid are reached, shown in red and refused at the release.
+                for (let j = 0; j < n_params; j++) {
+                    const v0 = pvals[params[j]];
+                    if (v0 !== undefined) dp[j] = Math.min(1, Math.max(0, v0 + dp[j])) - v0;
+                }
+                """
+                + self._probe.send_js("{idx: params, dp: dp}")
+                + """
+
                 // Predict positions for all group vertices from dp.
                 // Use orig_x/orig_y as base — the true pre-drag positions from Python.
                 for (let vi of vertices) {
@@ -531,7 +559,8 @@ class PrototileEditor(pn.viewable.Viewer):
                     "snap_h_span": self._snap_h_span,
                     "snap_v_span": self._snap_v_span,
                 },
-                code="""
+                code=self._probe.cancel_js
+                + """
             drag_state.data = {in_drag: [false], primary_dragged: [-1]};
             drag_state.change.emit();
             preview.data = {x: [], y: [], idx: []};
@@ -641,6 +670,7 @@ class PrototileEditor(pn.viewable.Viewer):
             "group_vertices": [group_vertices_json],
             "orig_x": [orig_x_json],
             "orig_y": [orig_y_json],
+            "values": [json.dumps(dict(enumerate(self.state.parameters)))],
         }
 
         # Update outline
@@ -688,6 +718,7 @@ class PrototileEditor(pn.viewable.Viewer):
             "line_color": line_colors,
         }
         self._edge_label_source.data = {"x": label_x, "y": label_y, "text": label_text, "shape_type": shape_types}
+        self._mark_invalid_edges()
 
         # Calculate bounds only when the reset_ranges flag is set
         if self.state.reset_ranges:
@@ -747,8 +778,6 @@ class PrototileEditor(pn.viewable.Viewer):
 
     def _update_edge_curves(self, tiling):
         edges = tiling.edge_outlines()
-        shape_ids = tiling.edge_shape_ids.tolist()
-        active_curve_id = self.state.active_curve_id
 
         # Rebuild renderers only when the edge count changes (tiling type switch).
         # For same-type updates (curve drag, undo/redo within type) we reuse the
@@ -766,11 +795,48 @@ class PrototileEditor(pn.viewable.Viewer):
                 self._curve_renderers.append(renderer)
 
         # Update data and style in place — no renderer add/remove, no blink.
-        for edge_idx, (points, shape_id) in enumerate(zip(edges, shape_ids, strict=True)):
+        for edge_idx, points in enumerate(edges):
             self._curve_sources[edge_idx].data = {"x": points[:, 0].tolist(), "y": points[:, 1].tolist()}
+        self._style_curves()
+
+    def _bad_shape_ids(self) -> set[int]:
+        validity = self.state.validity
+        return set(validity.shape_ids) if validity is not None else set()
+
+    def _style_curves(self) -> None:
+        """Color of the curve of each edge: red if its shape id makes the prototile invalid, orange if active."""
+        shape_ids = self.state.tiling.edge_shape_ids.tolist()
+        bad = self._bad_shape_ids()
+        active_curve_id = self.state.active_curve_id
+        for renderer, shape_id in zip(self._curve_renderers, shape_ids, strict=False):
             is_active = active_curve_id is not None and shape_id == active_curve_id
-            self._curve_renderers[edge_idx].glyph.line_color = "#ff6600" if is_active else "#444"
-            self._curve_renderers[edge_idx].glyph.line_width = 3 if is_active else 2
+            is_bad = shape_id in bad
+            renderer.glyph.line_color = INVALID_COLOR if is_bad else "#ff6600" if is_active else "#444"
+            renderer.glyph.line_width = 3.5 if is_bad else 3 if is_active else 2
+
+    def _mark_invalid_edges(self) -> None:
+        """Draw the edges of the shape ids named by ``state.validity`` in red."""
+        bad = self._bad_shape_ids()
+        shape_ids = self.state.tiling.edge_shape_ids.tolist()
+        self._bad_filter.booleans = [shape_id in bad for shape_id in shape_ids]
+
+    @param.depends("state.validity", watch=True)
+    def _show_validity(self):
+        self._mark_invalid_edges()
+        self._style_curves()
+
+    def _limits(self) -> list[tuple[float, float]]:
+        return self.state.parameter_limits()
+
+    def _on_probe(self, payload: dict) -> None:
+        """Parameter changes of a dragged vertex from the browser: check them without committing."""
+        try:
+            values = list(self.state.parameters)
+            for i, dp in zip(payload["idx"], payload["dp"], strict=True):
+                values[i] = max(0.0, min(1.0, values[i] + dp))
+        except (KeyError, IndexError, TypeError, ValueError):
+            return
+        self.state.probe_parameters(values)
 
     def _on_drag_state_change(self, attr, old, new):
         """Handle drag state changes from JS callback."""
@@ -926,13 +992,14 @@ class PrototileEditor(pn.viewable.Viewer):
         if groups and self.active_param_group < len(groups):
             active_params = set(groups[self.active_param_group]["params"])
 
-        # Build sliders with group-based styling
+        # Build sliders with group-based styling; the track shows the values at which the prototile is invalid
+        limits = self._limits()
         sliders = []
         for p in params:
             idx = p["index"]
             is_in_active_group = idx in active_params
 
-            # Highlight sliders in active group
+            lo, hi = limits[idx]
             slider = pn.widgets.FloatSlider(
                 name=f"P{idx}: {self._compact_desc(p['description'])}",
                 start=0,
@@ -940,9 +1007,10 @@ class PrototileEditor(pn.viewable.Viewer):
                 step=0.01,
                 value=self.state.parameters[idx] if idx < len(self.state.parameters) else p["default"],
                 # Visual feedback for active group
-                stylesheets=[self._get_slider_style(is_in_active_group)],
+                stylesheets=[self._get_slider_style(is_in_active_group, lo, hi)],
             )
-            slider.param.watch(lambda e, i=idx: self._on_slider_change(e, i), "value_throttled")
+            slider.param.watch(lambda e, i=idx, lim=(lo, hi): self._on_slider_probe(e, i, lim), "value")
+            slider.param.watch(lambda e, i=idx, lim=(lo, hi): self._on_slider_change(e, i, lim), "value_throttled")
             sliders.append(slider)
 
         # Group cycle button (only if multiple groups exist)
@@ -961,8 +1029,16 @@ class PrototileEditor(pn.viewable.Viewer):
             *sliders,
         )
 
-    def _get_slider_style(self, is_active: bool) -> str:
-        """Return CSS stylesheet for slider based on active state."""
+    def _get_slider_style(self, is_active: bool, lo: float = 0.0, hi: float = 1.0) -> str:
+        """Return CSS stylesheet for slider based on active state and the interval ``lo`` to ``hi`` of valid values."""
+        track = (
+            ".noUi-base { background: linear-gradient(to right, "
+            f"{INVALID_TRACK} 0 {lo * 100:.1f}%, transparent {lo * 100:.1f}% {hi * 100:.1f}%, "
+            f"{INVALID_TRACK} {hi * 100:.1f}% 100%); }}\n"
+        )
+        return track + self._slider_colors(is_active)
+
+    def _slider_colors(self, is_active: bool) -> str:
         if is_active:
             return """
             .bk-slider-title {
@@ -990,14 +1066,29 @@ class PrototileEditor(pn.viewable.Viewer):
         if len(groups) > 1:
             self.active_param_group = (self.active_param_group + 1) % len(groups)
 
-    def _on_slider_change(self, event, idx: int):
+    def _on_slider_probe(self, event, idx: int, limits: tuple[float, float]) -> None:
+        """A slider moves: it stays inside the valid interval; the value is checked without committing."""
+        slider = event.obj
+        clamped = max(limits[0], min(limits[1], event.new))
+        if clamped != event.new:
+            slider.value = clamped
+            return
+        values = list(self.state.parameters)
+        if idx < len(values) and values[idx] != clamped:
+            values[idx] = clamped
+            self.state.probe_parameters(values)
+
+    def _on_slider_change(self, event, idx: int, limits: tuple[float, float] = (0.0, 1.0)):
+        value = max(limits[0], min(limits[1], event.new))
+        if value != event.new:
+            event.obj.value = value
         params = self.state.parameters
-        if idx < len(params) and params[idx] != event.new:
+        if idx < len(params) and params[idx] != value:
             p_desc = self._compact_desc(self.state.type_info["parameters"][idx]["description"])
             # Rapid changes of the same slider coalesce into one history entry; a refused value redraws the sliders
             original_in_drag = self._in_drag
             self._in_drag = True  # block _on_vertex_change while the figure updates
             try:
-                self.state.set_parameter(idx, event.new, f"Adjust {p_desc}")
+                self.state.set_parameter(idx, value, f"Adjust {p_desc}")
             finally:
                 self._in_drag = original_in_drag

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import panel as pn
@@ -20,9 +21,11 @@ from isohedral_tiling_ui.editor_model import (
     Draft,
     EditorModel,
     add_node,
+    edge_shape_ids,
     move_node,
     remove_node,
     shape_of,
+    slider_limits,
     type_info,
 )
 from isohedral_tiling_ui.exports import Appearance
@@ -40,6 +43,27 @@ def panel_notify(level: str, message: str) -> None:
         logger.log(logging.ERROR if level == "error" else logging.INFO, "%s: %s", level, message)
     else:
         getattr(notifications, level)(message)
+
+
+HOLD_MS = 1500  # how long the display of an invalid edit stays after the edit was refused
+
+
+@dataclass(frozen=True)
+class Validity:
+    """An invalid draft that is shown: the edges and shape ids that the check names, and its message."""
+
+    bad_edges: tuple[int, ...]
+    shape_ids: tuple[int, ...]
+    message: str
+
+    def describe(self) -> str:
+        """``message`` with the curves and edges that it concerns, for a notification."""
+        where = ""
+        if self.shape_ids:
+            curves = ", ".join(f"C{i}" for i in self.shape_ids)
+            edges = ", ".join(str(e) for e in self.bad_edges)
+            where = f" (curve {curves}, edge{'s' if len(self.bad_edges) != 1 else ''} {edges})"
+        return f"{self.message}{where}"
 
 
 class ViewSettings(param.Parameterized):
@@ -69,6 +93,9 @@ class TilingState(param.Parameterized):
     source_label = param.String(default=DEFAULT_PRESET, doc="Preset name or file description; stem of file names")
     active_curve_id = param.Integer(default=None, allow_None=True)
     view = param.ClassSelector(class_=ViewSettings, constant=True)
+    validity = param.ClassSelector(
+        class_=Validity, default=None, allow_None=True, doc="The invalid draft that is shown (probe or refused edit)"
+    )
 
     def __init__(self, notify: Notify | None = None, **params: Any):
         model = EditorModel()
@@ -86,6 +113,7 @@ class TilingState(param.Parameterized):
         self.notify: Notify = notify or panel_notify
         self.reset_ranges = True  # the prototile editor fits its axes to the next draft, then clears the flag
         self._prototile_svg = self._baseline_icon()
+        self._hold_token = 0
 
     # -- views of the draft ----------------------------------------------------------------------------
 
@@ -167,6 +195,47 @@ class TilingState(param.Parameterized):
             self.notify("warning", f"Design repaired: {note}")
         return True
 
+    # -- validity of a draft that is not committed ------------------------------------------------------
+
+    def probe(self, draft: Draft) -> bool:
+        """Check a draft without committing it and show the result; True if it is valid."""
+        report = self.model.probe(draft)
+        self._show_validity(None if report.valid else self._validity(draft, report))
+        return report.valid
+
+    def probe_curve(self, shape_id: int, points: Any) -> bool:
+        """Probe a curve of a shape id (control points as dragged; the symmetry is enforced)."""
+        curve = enforce_symmetry(points, self.shape_type(shape_id))
+        return self.probe(self.draft.with_curve(shape_id, curve))
+
+    def probe_parameters(self, values: Any) -> bool:
+        return self.probe(self.draft.with_parameters(values))
+
+    def parameter_limits(self) -> list[tuple[float, float]]:
+        """The interval of each parameter in 0 to 1 in which the draft stays valid (``slider_limits``)."""
+        return [slider_limits(self.draft, k) for k in range(len(self.draft.parameters))]
+
+    def clear_validity(self, token: int | None = None) -> None:
+        """Stop showing an invalid draft (a hold that was superseded by a newer display is not cleared)."""
+        if token is None or token == self._hold_token:
+            self._show_validity(None)
+
+    def _validity(self, draft: Draft, report: Any) -> Validity:
+        return Validity(tuple(report.bad_edges), edge_shape_ids(draft.type_number, report.bad_edges), report.message)
+
+    def _show_validity(self, validity: Validity | None) -> None:
+        self._hold_token += 1
+        if validity != self.validity:
+            self.validity = validity
+
+    def _hold_validity(self, validity: Validity) -> None:
+        """Show the invalid draft of a refused edit for ``HOLD_MS``."""
+        self._show_validity(validity)
+        doc = pn.state.curdoc
+        if doc is not None:
+            token = self._hold_token
+            doc.add_timeout_callback(lambda: self.clear_validity(token), HOLD_MS)
+
     # -- edits -----------------------------------------------------------------------------------------
 
     def set_parameter(self, index: int, value: float, label: str) -> bool:
@@ -212,9 +281,11 @@ class TilingState(param.Parameterized):
             if self.model.draft != self.draft:
                 self._publish()
             return True
-        self.notify("error", f"Not applied ({label}): {result.report.message}")
+        validity = self._validity(draft, result.report)
+        self.notify("error", f"Not applied ({label}): {validity.describe()}")
         # The views may show the refused input; redraw them from the current draft
         self.param.trigger("draft", "parameters", "edge_curve_modes")
+        self._hold_validity(validity)
         return False
 
     def _baseline_icon(self) -> str:
@@ -244,6 +315,7 @@ class TilingState(param.Parameterized):
         }
         if source_label is not None:
             updates["source_label"] = source_label
+        self._show_validity(None)
         self.param.update(**updates)
         if same:
             self.param.trigger("draft", "parameters", "edge_curve_modes")

@@ -348,6 +348,49 @@ def editable(shape: str, n_nodes: int, i: int) -> bool:
     return i < half
 
 
+def edge_shape_ids(type_number: int, edges: Any) -> tuple[int, ...]:
+    """The distinct shape ids of the edges (indices into the outline) of a type, ascending."""
+    ids = get_type(type_number).edge_shape_ids
+    return tuple(sorted({int(ids[i]) for i in edges}))
+
+
+def slider_limits(
+    draft: Draft, k: int, window: tuple[float, float] = (0.0, 1.0), samples: int = 11, tol: float = 1e-3
+) -> tuple[float, float]:
+    """Interval within ``window`` around the value of parameter ``k`` in which the draft stays valid.
+
+    The other parameters and the curves are as they are in the draft. Each end is found by testing ``samples`` points
+    from the current value toward the window edge and bisecting to ``tol`` between the last valid and the first invalid
+    point. A valid island beyond an invalid stretch narrower than a sample step is not seen.
+    """
+    return _slider_limits(draft, k, window, samples, tol)
+
+
+@lru_cache(maxsize=512)
+def _slider_limits(draft: Draft, k: int, window: tuple[float, float], samples: int, tol: float) -> tuple[float, float]:
+    v0 = draft.parameters[k]
+
+    def valid(v: float) -> bool:
+        p = list(draft.parameters)
+        p[k] = v
+        return draft.with_parameters(p).report().valid
+
+    def end(target: float) -> float:
+        last = v0
+        for v in np.linspace(v0, target, samples)[1:]:
+            if valid(float(v)):
+                last = float(v)
+                continue
+            lo, hi = last, float(v)
+            while abs(hi - lo) > tol:
+                mid = (lo + hi) / 2
+                lo, hi = (mid, hi) if valid(mid) else (lo, mid)
+            return lo
+        return target
+
+    return end(window[0]), end(window[1])
+
+
 def preset_curve(name: str, shape: str) -> np.ndarray:
     """The control points of a curve preset for an edge shape.
 

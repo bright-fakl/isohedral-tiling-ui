@@ -8,6 +8,7 @@ from .history_toolbar import HistoryToolbar
 from .load_save import LoadSavePanel
 from .preview_strip import PreviewStrip
 from .prototile_editor import PrototileEditor
+from .status_line import StatusLine
 from .type_selector import TileTypeSelector
 
 __all__ = [
@@ -17,5 +18,6 @@ __all__ = [
     "LoadSavePanel",
     "PreviewStrip",
     "PrototileEditor",
+    "StatusLine",
     "TileTypeSelector",
 ]

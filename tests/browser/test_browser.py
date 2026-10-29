@@ -270,6 +270,29 @@ class App:
         )
         return d[0], d[1]
 
+    def validity(self) -> dict:
+        """The red display: the color of the dragged curve, the red edges of the prototile editor, the status text."""
+        shown = self.js(
+            """() => {
+            const all = [...Bokeh.documents[0].all_models];
+            const fig = all.find(m => m.type === 'Figure' && m.renderers.some(
+                r => r.data_source && r.data_source.name === 'curve'));
+            const r = fig.renderers.find(r => r.data_source && r.data_source.name === 'curve');
+            const filters = all.filter(m => m.type === 'BooleanFilter');
+            return {curve: r.glyph.line_color.value, bad: filters.map(f => Array.from(f.booleans))};
+            }"""
+        )
+        shown["status"] = self.page.get_by_text("Invalid:").count() > 0
+        shown["red_edges"] = sum(sum(b) for b in shown["bad"])
+        return shown
+
+    def toasts(self) -> list[str]:
+        return self.page.get_by_text("Not applied").all_inner_texts()
+
+    def probe_log(self) -> list[float]:
+        """Round-trip times in ms of the probes of this page."""
+        return self.js("() => (window._isoProbeLog || []).slice()")
+
     def tap_empty(self) -> None:
         nodes = self.curve_nodes()
         self.page.mouse.click(nodes["px"][0] - 30, nodes["py"][0] - 80)
@@ -313,7 +336,8 @@ def test_nodes_have_one_color_and_the_selection_survives_a_drag(app):
     app.click_preset("scalloped")
     nodes = app.curve_nodes()
     assert set(nodes["fill"]) == {"#444"}  # no node is special
-    n = app.undo_count()
+    app.wait_for(app.undo_count, 1)
+    n = 1
     app.drag_node(1, 0, -40)  # drag the middle node up, release
     after = app.curve_nodes()
     assert after["y"][1] > nodes["y"][1] + 0.2
@@ -557,3 +581,139 @@ def test_presets_are_not_muted_after_a_tile_without_curves(app):
     app.click_model(app.button("tile:wavy_triangle"))
     app.wait_for(lambda: app.curve_editor_state()["shown"], True)
     app.expect_presets_match(expected(preset="wavy_triangle"))
+
+
+def drag_and_hold(app, x, y, moves):
+    """Press at (x, y) and move along ``moves`` (relative offsets) without releasing."""
+    app.page.mouse.move(x, y)
+    app.page.mouse.down()
+    for dx, dy in moves:
+        app.page.mouse.move(x + dx, y + dy, steps=6)
+    time.sleep(0.8)
+
+
+def test_a_node_dragged_into_an_invalid_position_is_red_and_reverted_on_release(app):
+    app.click_text("Tiling Type")
+    app.click_model(app.button("type:36"))
+    app.wait_for(lambda: app.marked("type"), ["36"])
+    app.click_preset("scalloped")
+    app.wait_for(app.undo_count, 1)
+    before = app.curve_nodes()
+    assert app.validity()["curve"] == "steelblue" and app.validity()["red_edges"] == 0
+    drag_and_hold(app, before["px"][1], before["py"][1], [(0, -20), (0, -60)])
+    shown = app.validity()
+    assert shown["curve"] == "#d62728"  # the dragged curve
+    assert shown["red_edges"] > 0 and shown["status"]  # the edges in the prototile editor and the message
+    app.page.mouse.up()
+    time.sleep(0.8)
+    after = app.curve_nodes()
+    assert after["y"] == before["y"] and after["x"] == before["x"]  # back at the last valid position
+    assert app.undo_count() == 1  # nothing was committed
+    assert any("Not applied" in t and "C0" in t and "edge" in t for t in app.toasts()), app.toasts()
+    assert app.validity()["curve"] == "#d62728"  # the red display stays after the release
+    app.wait_for(lambda: app.validity()["curve"], "steelblue")  # and goes after 1.5 s
+    assert app.validity()["red_edges"] == 0 and not app.validity()["status"]
+
+
+def test_red_clears_when_the_dragged_node_is_valid_again(app):
+    app.click_text("Tiling Type")
+    app.click_model(app.button("type:36"))
+    app.wait_for(lambda: app.marked("type"), ["36"])
+    app.click_preset("scalloped")
+    before = app.curve_nodes()
+    x, y = before["px"][1], before["py"][1]
+    drag_and_hold(app, x, y, [(0, -60)])
+    assert app.validity()["curve"] == "#d62728"
+    app.page.mouse.move(x, y - 5, steps=6)  # back to a valid position, still pressed
+    app.wait_for(lambda: app.validity()["curve"], "steelblue")
+    assert app.validity()["red_edges"] == 0
+    app.page.mouse.up()
+    app.wait_for(app.undo_count, 2)  # a valid release commits
+
+
+def vertex_pixels(app, number: int, parameter_change: float):
+    """Screen offset of the first movable handle for a change of the parameter (the vertices are affine in it)."""
+    from isohedral_tiling_ui.editor_model import parameter_groups
+
+    group = parameter_groups(number)[0]
+    handles = app.vertices()
+    indices = app.js(
+        """() => {
+        const fig = [...Bokeh.documents[0].all_models].find(m => m.type === 'Figure' && m.toolbar.tools.some(
+            t => t.type === 'PointDrawTool' && !t.renderers[0].data_source.data.editable));
+        return Array.from(fig.toolbar.tools.find(t => t.type === 'PointDrawTool').renderers[0].data_source.data.idx);
+        }"""
+    )
+    vertex = indices[0]
+    dx, dy = group["jacobian"][(vertex, group["params"][0])]
+    scale = abs((handles["py"][1] - handles["py"][0]) / (handles["y"][1] - handles["y"][0]))  # px per unit
+    return handles["px"][0], handles["py"][0], dx * parameter_change * scale, -dy * parameter_change * scale
+
+
+def test_a_vertex_dragged_to_an_invalid_parameter_is_red_and_reverted_on_release(app):
+    app.click_text("Tiling Type")
+    app.click_model(app.button("type:30"))  # valid for the parameter up to 0.487; the default is 0.231
+    app.wait_for(lambda: app.marked("type"), ["30"])
+    x, y, dx, dy = vertex_pixels(app, 30, 0.4)
+    before = app.vertices()
+    n = app.undo_count()
+    drag_and_hold(app, x, y, [(dx, dy)])
+    shown = app.validity()
+    assert shown["red_edges"] > 0 and shown["status"]
+    app.page.mouse.up()
+    time.sleep(1.0)
+    assert app.undo_count() == n  # nothing was committed
+    assert app.vertices()["x"] == pytest.approx(before["x"])  # the handles are back
+    assert any("Not applied" in t and "C0" in t for t in app.toasts()), app.toasts()
+    app.wait_for(lambda: app.validity()["red_edges"], 0)
+
+
+def test_a_vertex_dragged_to_a_valid_parameter_has_no_red(app):
+    app.click_text("Tiling Type")
+    app.click_model(app.button("type:30"))
+    app.wait_for(lambda: app.marked("type"), ["30"])
+    x, y, dx, dy = vertex_pixels(app, 30, 0.1)
+    n = app.undo_count()
+    drag_and_hold(app, x, y, [(dx, dy)])
+    assert app.validity()["red_edges"] == 0 and not app.validity()["status"]
+    app.page.mouse.up()
+    app.wait_for(app.undo_count, n + 1)
+
+
+def test_the_slider_cannot_reach_a_value_that_makes_the_prototile_invalid(app):
+    app.click_text("Tiling Type")
+    app.click_model(app.button("type:30"))
+    app.wait_for(lambda: app.marked("type"), ["30"])
+    handle = app.page.locator(".noUi-handle").first
+    box = handle.bounding_box()
+    track = app.page.locator(".noUi-base").first.bounding_box()
+    app.page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    app.page.mouse.down()
+    app.page.mouse.move(track["x"] + track["width"] - 2, box["y"] + box["height"] / 2, steps=12)  # to the end
+    time.sleep(1.0)
+    app.page.mouse.up()
+    time.sleep(1.0)
+    value = app.js("() => [...Bokeh.documents[0].all_models].find(m => m.type === 'Slider' && m.step).value")
+    assert 0.35 < value <= 0.49  # held at the limit (0.487), not at 1
+    assert app.validity()["red_edges"] == 0
+    assert not any("Not applied" in t for t in app.toasts())
+
+
+def test_probe_round_trip_is_measured(app):
+    app.click_text("Tiling Type")
+    app.click_model(app.button("type:36"))
+    app.wait_for(lambda: app.marked("type"), ["36"])
+    app.click_preset("scalloped")
+    nodes = app.curve_nodes()
+    x, y = nodes["px"][1], nodes["py"][1]
+    app.page.mouse.move(x, y)
+    app.page.mouse.down()
+    for i in range(1, 41):  # a slow drag of 2.4 s with moves of 1 px every 60 ms
+        app.page.mouse.move(x, y - 8 - i)
+        time.sleep(0.06)
+    log = app.probe_log()
+    app.page.mouse.up()
+    assert 8 <= len(log) <= 25
+    median = sorted(log)[len(log) // 2]
+    print(f"probe round trip: n={len(log)} median {median:.0f} ms, max {max(log):.0f} ms")
+    assert median < 500
