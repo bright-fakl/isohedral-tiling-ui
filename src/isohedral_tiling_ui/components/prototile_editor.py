@@ -7,6 +7,8 @@ import param
 from bokeh.models import ColumnDataSource, CustomJS, LabelSet, PointDrawTool
 from bokeh.plotting import figure
 
+from isohedral_tiling_ui.editor_model import parameter_groups
+
 
 class PrototileEditor(pn.viewable.Viewer):
     """Interactive prototile editor with draggable vertices."""
@@ -543,41 +545,18 @@ class PrototileEditor(pn.viewable.Viewer):
         self._drag_state_source.on_change("data", self._on_drag_state_change)
         self._draggable_source.on_change("data", self._on_vertex_change)
 
-    @param.depends(
-        "state._tiling",
-        "state._type_info",
-        "state.parameters",
-        "show_curves",
-        "state.edge_curves",
-        "state.edge_curve_modes",
-        "state.active_curve_id",
-        "active_param_group",
-        "state.parameters_version",
-        watch=True,
-    )
+    @param.depends("state.draft", "show_curves", "state.active_curve_id", "active_param_group", watch=True)
     def _update_figure(self):
-        """Update figure when tiling state changes.
-
-        Skips updates during batch operations and only updates once after
-        the entire batch completes.
-        """
-        # Skip during batch updates - wait for all parameters to be updated
-        if hasattr(self.state, "_batching") and self.state._batching:
-            return
-
-        # Only update if we have both tiling and type info
-        tiling = self.state._tiling
-        info = self.state._type_info
-        if tiling is None or info is None:
-            return
-        verts = [(v.x, v.y) for v in tiling._ih.vertices]
+        """Update the figure from the current draft."""
+        tiling = self.state.tiling
+        info = self.state.type_info
+        verts = [tuple(v) for v in tiling.vertices.tolist()]
 
         # Prevent _on_vertex_change from firing when we update draggable source programmatically
         self._in_drag = True
 
         # Forcefully update draggable vertices from current tiling state
-        params = info.get("parameters", [])
-        groups = self._get_parameter_groups(params)
+        groups = parameter_groups(self.state.tiling_type)
         active_vertices = set()
         if groups and self.active_param_group < len(groups):
             active_vertices = groups[self.active_param_group]["vertices"]
@@ -620,50 +599,6 @@ class PrototileEditor(pn.viewable.Viewer):
         }
 
         n = len(verts)
-        params = info.get("parameters", [])
-        self._build_vertex_param_map(params)
-
-        # Separate draggable and fixed vertices - only active group vertices are draggable
-        groups = self._get_parameter_groups(params)
-        active_vertices = set()
-        if groups and self.active_param_group < len(groups):
-            active_vertices = groups[self.active_param_group]["vertices"]
-
-        drag_x, drag_y, drag_idx = [], [], []
-        fix_x, fix_y, fix_idx = [], [], []
-
-        for i in range(n):
-            if i in active_vertices:
-                drag_x.append(verts[i][0])
-                drag_y.append(verts[i][1])
-                drag_idx.append(i)
-            else:
-                fix_x.append(verts[i][0])
-                fix_y.append(verts[i][1])
-                fix_idx.append(i)
-
-        # Colors for draggable vertices (all in active group are highlighted)
-        drag_fill = ["orange" for _ in drag_idx]
-        drag_line = ["#c05000" for _ in drag_idx]
-
-        # Colors for fixed vertices
-        fix_fill = ["#ddd"] * len(fix_idx)
-        fix_line = ["#999"] * len(fix_idx)
-
-        self._draggable_source.data = {
-            "x": drag_x,
-            "y": drag_y,
-            "idx": drag_idx,
-            "fill_color": drag_fill,
-            "line_color": drag_line,
-        }
-        self._fixed_source.data = {
-            "x": fix_x,
-            "y": fix_y,
-            "idx": fix_idx,
-            "fill_color": fix_fill,
-            "line_color": fix_line,
-        }
 
         # Clear preview source to prevent ghost vertices
         self._preview_source.data = {"x": [], "y": [], "idx": []}
@@ -754,8 +689,8 @@ class PrototileEditor(pn.viewable.Viewer):
         }
         self._edge_label_source.data = {"x": label_x, "y": label_y, "text": label_text, "shape_type": shape_types}
 
-        # Calculate bounds only when _reset_ranges flag is set
-        if self.state._reset_ranges:
+        # Calculate bounds only when the reset_ranges flag is set
+        if self.state.reset_ranges:
             all_x = [v[0] for v in verts]
             all_y = [v[1] for v in verts]
             x_min, x_max = min(all_x), max(all_x)
@@ -794,10 +729,10 @@ class PrototileEditor(pn.viewable.Viewer):
 
             self._figure.x_range.start, self._figure.x_range.end = x_range
             self._figure.y_range.start, self._figure.y_range.end = y_range
-            self.state._reset_ranges = False  # Reset the flag
+            self.state.reset_ranges = False  # Reset the flag
 
         if self.show_curves:
-            self._update_edge_curves(tiling, verts, info)
+            self._update_edge_curves(tiling)
         else:
             # Ensure curves are hidden if show_curves is False
             for renderer in self._curve_renderers:
@@ -810,153 +745,32 @@ class PrototileEditor(pn.viewable.Viewer):
         # Reset the flag
         self._in_drag = False
 
-    def _get_parameter_groups(self, params: list) -> list[dict]:
-        """Build parameter groups with orthogonality-aware merging.
+    def _update_edge_curves(self, tiling):
+        edges = tiling.edge_outlines()
+        shape_ids = tiling.edge_shape_ids.tolist()
+        active_curve_id = self.state.active_curve_id
 
-        Two parameters are placed in the same group if:
-        1. They share at least one affected vertex, AND
-        2. At EVERY shared vertex, their Jacobian vectors are orthogonal, AND
-        3. Each new parameter is orthogonal to ALL existing group members
-        """
-        if not params:
-            return []
+        # Rebuild renderers only when the edge count changes (tiling type switch).
+        # For same-type updates (curve drag, undo/redo within type) we reuse the
+        # existing renderers and only push new data into their sources, which avoids
+        # the Bokeh renderer-list mutation that causes visible blinking.
+        if len(self._curve_renderers) != len(edges):
+            for renderer in self._curve_renderers:
+                self._figure.renderers.remove(renderer)
+            self._curve_renderers.clear()
+            self._curve_sources.clear()
+            for edge_idx in range(len(edges)):
+                source = ColumnDataSource(data={"x": [], "y": []})
+                self._curve_sources[edge_idx] = source
+                renderer = self._figure.line("x", "y", source=source, name="thick_curve")
+                self._curve_renderers.append(renderer)
 
-        # Build vertex → [(param_idx, dx, dy)] mapping
-        vertex_params: dict[int, list[tuple[int, float, float]]] = {}
-        for p in params:
-            for av in p["affected_vertices"]:
-                vertex_params.setdefault(av["vertex"], []).append((p["index"], av["dx_dp"], av["dy_dp"]))
-
-        # Build param → vertices mapping
-        param_vertices: dict[int, set[int]] = {}
-        for p in params:
-            param_vertices[p["index"]] = {av["vertex"] for av in p["affected_vertices"]}
-
-        def are_orthogonal(dx1, dy1, dx2, dy2, threshold=0.3):
-            """Check if two derivative vectors are orthogonal (cos_angle < threshold)."""
-            dot = dx1 * dx2 + dy1 * dy2
-            mag1 = (dx1**2 + dy1**2) ** 0.5
-            mag2 = (dx2**2 + dy2**2) ** 0.5
-            if mag1 < 1e-9 or mag2 < 1e-9:
-                return True
-            cos_angle = abs(dot) / (mag1 * mag2)
-            return cos_angle < threshold
-
-        def can_merge_with_group(p_idx, group_indices):
-            """Check if parameter can be merged with existing group."""
-            for existing_idx in group_indices:
-                shared = param_vertices[p_idx] & param_vertices[existing_idx]
-                if shared:
-                    # Must be orthogonal at ALL shared vertices
-                    for v in shared:
-                        # Find derivatives for both params at vertex v
-                        d1 = next((dx, dy) for pi, dx, dy in vertex_params[v] if pi == p_idx)
-                        d2 = next((dx, dy) for pi, dx, dy in vertex_params[v] if pi == existing_idx)
-                        if not are_orthogonal(d1[0], d1[1], d2[0], d2[1]):
-                            return False
-            return True
-
-        # Build groups using modified connected components
-        groups = []
-        visited = set()
-
-        for p in params:
-            if p["index"] in visited:
-                continue
-
-            # Start new group
-            group_params = {p["index"]}
-            queue = [p["index"]]
-
-            while queue:
-                current = queue.pop(0)
-                if current in visited:
-                    continue
-                visited.add(current)
-
-                # Find compatible parameters
-                for v in param_vertices.get(current, set()):
-                    for other_idx, _, _ in vertex_params.get(v, set()):
-                        if other_idx not in visited and other_idx not in group_params:
-                            if can_merge_with_group(other_idx, group_params):
-                                group_params.add(other_idx)
-                                queue.append(other_idx)
-
-            # Collect vertices and build Jacobian
-            group_vertices = set()
-            jacobian = {}
-            for pi in group_params:
-                param_info = next(p for p in params if p["index"] == pi)
-                for av in param_info["affected_vertices"]:
-                    group_vertices.add(av["vertex"])
-                    jacobian[(av["vertex"], pi)] = (av["dx_dp"], av["dy_dp"])
-
-            groups.append({
-                "params": sorted(group_params),
-                "vertices": group_vertices,
-                "jacobian": jacobian,
-            })
-
-        return groups
-
-    def _build_vertex_param_map(self, params: list) -> dict:
-        mapping = {}
-        for p in params:
-            for av in p["affected_vertices"]:
-                mapping.setdefault(av["vertex"], []).append(p)
-        return mapping
-
-    def _update_edge_curves(self, tiling, verts, info):
-        try:
-            from tactile import Point as _P
-            from tactile import mul as _mul
-
-            from isohedral_tiling_ui.utils.spline_cache import interpolate_spline
-
-            shapes = list(tiling._ih.shapes)
-            active_curve_id = self.state.active_curve_id
-
-            # Rebuild renderers only when the shape count changes (tiling type switch).
-            # For same-type updates (curve drag, undo/redo within type) we reuse the
-            # existing renderers and only push new data into their sources, which avoids
-            # the Bokeh renderer-list mutation that causes visible blinking.
-            if len(self._curve_renderers) != len(shapes):
-                for renderer in self._curve_renderers:
-                    self._figure.renderers.remove(renderer)
-                self._curve_renderers.clear()
-                self._curve_sources.clear()
-                for edge_idx, shape_info in enumerate(shapes):
-                    is_active = active_curve_id is not None and shape_info.id == active_curve_id
-                    source = ColumnDataSource(data={"x": [], "y": []})
-                    self._curve_sources[edge_idx] = source
-                    renderer = self._figure.line(
-                        "x",
-                        "y",
-                        source=source,
-                        line_color="#ff6600" if is_active else "#444",
-                        line_width=3 if is_active else 2,
-                        name="thick_curve",
-                    )
-                    self._curve_renderers.append(renderer)
-
-            # Update data and style in place — no renderer add/remove, no blink.
-            for edge_idx, shape_info in enumerate(shapes):
-                raw = self.state.edge_curves.get(shape_info.id) or [(0, 0), (1, 0)]
-                mode = self.state.edge_curve_modes.get(shape_info.id, "spline")
-                curve = (
-                    interpolate_spline([tuple(p) for p in raw])
-                    if mode == "spline" and len(raw) >= 3
-                    else [tuple(p) for p in raw]
-                )
-                pts = [_mul(shape_info.T, _P(x, y)) for x, y in curve]
-                if shape_info.rev:
-                    pts = pts[::-1]
-                self._curve_sources[edge_idx].data = {"x": [p.x for p in pts], "y": [p.y for p in pts]}
-                is_active = active_curve_id is not None and shape_info.id == active_curve_id
-                self._curve_renderers[edge_idx].glyph.line_color = "#ff6600" if is_active else "#444"
-                self._curve_renderers[edge_idx].glyph.line_width = 3 if is_active else 2
-        except Exception:
-            pass
+        # Update data and style in place — no renderer add/remove, no blink.
+        for edge_idx, (points, shape_id) in enumerate(zip(edges, shape_ids, strict=True)):
+            self._curve_sources[edge_idx].data = {"x": points[:, 0].tolist(), "y": points[:, 1].tolist()}
+            is_active = active_curve_id is not None and shape_id == active_curve_id
+            self._curve_renderers[edge_idx].glyph.line_color = "#ff6600" if is_active else "#444"
+            self._curve_renderers[edge_idx].glyph.line_width = 3 if is_active else 2
 
     def _on_drag_state_change(self, attr, old, new):
         """Handle drag state changes from JS callback."""
@@ -976,11 +790,6 @@ class PrototileEditor(pn.viewable.Viewer):
         """Handle vertex drag changes - fires after drag is complete."""
         # Prevent feedback loop
         if self._in_drag:
-            return
-
-        tiling = self.state._tiling
-        info = self.state._type_info
-        if tiling is None or info is None:
             return
 
         # Use stored Jacobian data instead of recomputing
@@ -1026,17 +835,15 @@ class PrototileEditor(pn.viewable.Viewer):
             new_params = list(self.state.parameters)
             for pi, dp in param_deltas.items():
                 new_params[pi] = max(0, min(1, new_params[pi] + dp))
-            self.state.parameters = new_params
-            # Update _orig_positions to new vertex positions after parameter change
-            tiling = self.state._tiling
-            verts = [(v.x, v.y) for v in tiling._ih.vertices]
+            # A refused edit redraws the figure from the unchanged draft
+            self.state.set_parameters(new_params)
+            # Update _orig_positions to the vertex positions of the current draft
+            verts = self.state.tiling.vertices
             self._orig_positions = {
-                "x": [v[0] for v in verts],
-                "y": [v[1] for v in verts],
+                "x": verts[:, 0].tolist(),
+                "y": verts[:, 1].tolist(),
                 "idx": list(range(len(verts))),
             }
-            # Push the new state to history
-            self.state.push_history("Move prototile vertices", force_new=True)
         finally:
             self._in_drag = False
 
@@ -1085,15 +892,10 @@ class PrototileEditor(pn.viewable.Viewer):
         except np.linalg.LinAlgError:
             return {}
 
-    def _solve_param_delta(self, param_info: dict, dvx: float, dvy: float) -> float:
-        dx_dp = param_info["affected_vertices"][0]["dx_dp"]
-        dy_dp = param_info["affected_vertices"][0]["dy_dp"]
-        den = dx_dp**2 + dy_dp**2
-        return (dvx * dx_dp + dvy * dy_dp) / den if den > 1e-12 else 0.0
-
     def _compact_desc(self, desc: str) -> str:
         return (
-            desc.replace("moves ", "")
+            desc
+            .replace("moves ", "")
             .replace(" horizontally", " ↔")
             .replace(" vertically", " ↕")
             .replace(" diagonally", " ↗")
@@ -1109,21 +911,15 @@ class PrototileEditor(pn.viewable.Viewer):
             align=("center", "start"),
         )
 
-    @param.depends("state._type_info", "state.parameters", "active_param_group", "state._batching")
+    @param.depends("state.draft", "active_param_group")
     def _build_parameter_panel(self):
-        # Skip during batch updates - wait for _type_info to be updated
-        if hasattr(self.state, "_batching") and self.state._batching:
-            return pn.Spacer()
-
-        info = self.state._type_info
-        if info is None:
-            return pn.pane.Markdown("*Loading...*")
+        info = self.state.type_info
         params = info.get("parameters", [])
 
         if not params:
             return pn.pane.Markdown("*No adjustable parameters*")
 
-        groups = self._get_parameter_groups(params)
+        groups = parameter_groups(self.state.tiling_type)
 
         # Get active group's parameters
         active_params = set()
@@ -1190,34 +986,18 @@ class PrototileEditor(pn.viewable.Viewer):
 
     def _cycle_group(self, event):
         """Cycle to next parameter group."""
-        params = self.state._type_info.get("parameters", []) if self.state._type_info else []
-        groups = self._get_parameter_groups(params)
+        groups = parameter_groups(self.state.tiling_type)
         if len(groups) > 1:
             self.active_param_group = (self.active_param_group + 1) % len(groups)
 
     def _on_slider_change(self, event, idx: int):
-        # Push current state to history and apply change
-        print(f"DEBUG: _on_slider_change START - p{idx}={event.new}, params={self.state.parameters}")
-        params = list(self.state.parameters)
+        params = self.state.parameters
         if idx < len(params) and params[idx] != event.new:
-            # Apply the parameter change immediately
-            params[idx] = event.new
-            print(f"DEBUG: Setting state.parameters to {params}")
-            # Temporarily block _on_vertex_change from triggering
+            p_desc = self._compact_desc(self.state.type_info["parameters"][idx]["description"])
+            # Rapid changes of the same slider coalesce into one history entry; a refused value redraws the sliders
             original_in_drag = self._in_drag
-            self._in_drag = True
+            self._in_drag = True  # block _on_vertex_change while the figure updates
             try:
-                self.state.parameters = params
+                self.state.set_parameter(idx, event.new, f"Adjust {p_desc}")
             finally:
                 self._in_drag = original_in_drag
-            # Push the new state to history (coalesce rapid clicks on the same slider)
-            type_info = self.state._type_info or {}
-            p_desc = self._compact_desc(
-                next((p["description"] for p in type_info.get("parameters", []) if p["index"] == idx), f"P{idx}")
-            )
-            self.state.push_history(
-                f"Adjust {p_desc}",
-                coalesce_key=f"slider_p{idx}",
-                coalesce_window_ms=1000,
-            )
-        print(f"DEBUG: _on_slider_change END - params={self.state.parameters}")

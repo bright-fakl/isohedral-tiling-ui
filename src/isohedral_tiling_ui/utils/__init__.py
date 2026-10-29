@@ -3,6 +3,6 @@
 from __future__ import annotations
 
 __all__ = [
-    "spline_cache",
-    "symmetry",
+    "curve_presets",
+    "icons",
 ]

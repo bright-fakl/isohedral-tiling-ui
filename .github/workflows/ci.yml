@@ -41,7 +41,7 @@ jobs:
           uv venv --python 3.12
           uv pip install -e . --group dev -c ci/constraints.txt
       - name: mypy (the existing findings do not block)
-        run: uv run --no-sync mypy || echo "::warning::mypy reports findings (advisory; baseline 495 errors in 11 files)"
+        run: uv run --no-sync mypy || echo "::warning::mypy reports findings (advisory; baseline 296 errors in 9 files)"
 
   tests:
     name: tests (Python ${{ matrix.python-version }})

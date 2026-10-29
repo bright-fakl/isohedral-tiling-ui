@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import io
 import json
-from datetime import datetime, timezone
 
 import panel as pn
 import param
+
+from isohedral_tiling_ui.exports import design_json
 
 
 class LoadSavePanel(pn.viewable.Viewer):
@@ -61,7 +62,7 @@ class LoadSavePanel(pn.viewable.Viewer):
             sizing_mode="stretch_width",
         )
         self._filename_input.param.watch(self._on_filename_change, "value")
-        self.state.param.watch(self._update_filename, ["tiling_type", "current_preset"])
+        self.state.param.watch(self._update_filename, ["source_label", "tiling_type"])
 
         # Save Design button
         self._json_download = pn.widgets.FileDownload(
@@ -71,13 +72,12 @@ class LoadSavePanel(pn.viewable.Viewer):
             sizing_mode="stretch_width",
         )
         self._json_download.param.watch(
-            lambda e: pn.state.notifications.success(f"'{self._json_download.filename}' saved to downloads folder"),
+            lambda e: self.state.notify("success", f"'{self._json_download.filename}' saved to downloads folder"),
             "_clicks",
         )
 
     def _default_filename(self) -> str:
-        preset = getattr(self.state, "current_preset", "")
-        return preset if preset else f"IH{self.state.tiling_type}"
+        return self.state.default_name
 
     def _update_filename(self, *events):
         """Auto-populate filename when tiling type or preset changes."""
@@ -94,67 +94,20 @@ class LoadSavePanel(pn.viewable.Viewer):
         if not event.new:
             return
         try:
-            from carto_flow.symbol_cartogram.tiling import IsohedralTiling
-
             data = json.loads(event.new)
-            tiling_type = data["tiling_type"]
-            parameters = data.get("parameters", [])
-            edge_curves = {int(k): [tuple(p) for p in v] for k, v in data.get("edge_curves", {}).items()}
-            edge_curve_modes = {int(k): v for k, v in data.get("edge_curve_modes", {}).items()}
-            desc = data.get("description", "")
-
-            # Build tiling so we can generate the reference SVG and get type info.
-            tiling = IsohedralTiling(
-                tiling_type=tiling_type,
-                parameters=parameters,
-                edge_curves=edge_curves,
-            )
-            info = tiling.type_info()
-            customizable = info.get("customizable_shape_ids", [])
-
-            # Mirror what load_preset does so all dependent views update correctly.
-            with self.state.batch_update():
-                self.state.tiling_type = tiling_type
-                self.state.parameters = parameters
-                self.state.edge_curves = edge_curves
-                self.state.edge_curve_modes = edge_curve_modes
-                self.state.current_preset = desc
-                if customizable:
-                    self.state.active_curve_id = customizable[0]
-                self.state._reset_ranges = True  # resets prototile axis limits
-                self.state.parameters_version += 1
-                # Update initial-state bookmarks (reference tile SVG, reset target)
-                self.state._initial_parameters = parameters
-                self.state._initial_edge_curves = edge_curves
-                self.state._initial_preset_name = desc
-                self.state._initial_prototile_svg = self.state._generate_prototile_svg(tiling)
-                self.state.reset_available = False
-
-            # Clear undo/redo history; make the loaded design the first entry.
-            label = desc.replace("_", " ").title() if desc else f"IH{tiling_type}"
-            self.state._history = [self.state._snapshot(f"Load '{label}'")]
-            self.state._history_idx = 0
-            self.state._last_coalesce_key = None
-            self.state._last_coalesce_time = None
-
+        except ValueError as e:
+            self.state.notify("error", f"Failed to load: not a JSON file ({e})")
+            return
+        desc = str(data.get("description", "")) if isinstance(data, dict) else ""
+        if self.state.load_data(data, desc):
             if desc:
                 self._filename_input.value = desc
-            pn.state.notifications.success("Design loaded")
-        except Exception as e:
-            pn.state.notifications.error(f"Failed to load: {e}")
+            self.state.notify("success", "Design loaded")
 
     def _save_config(self):
-        """Generate and download JSON config."""
-        config = {
-            "version": "1.0",
-            "tiling_type": self.state.tiling_type,
-            "parameters": self.state.parameters,
-            "edge_curves": {str(k): [list(p) for p in v] for k, v in self.state.edge_curves.items()},
-            "edge_curve_modes": {str(k): v for k, v in self.state.edge_curve_modes.items()},
-            "description": self._filename_input.value.strip() or self._default_filename(),
-            "metadata": {"created": datetime.now(timezone.utc).isoformat()},
-        }
-        return io.StringIO(json.dumps(config, indent=2))
+        """Generate and download the design as JSON (isotile format 1.1 with description and metadata)."""
+        description = self._filename_input.value.strip() or self._default_filename()
+        return io.StringIO(design_json(self.state.tiling, description))
 
     def __panel__(self):
         # _file_json must be in the layout so its Bokeh model is created and
