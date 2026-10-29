@@ -1,5 +1,8 @@
 """Shared code of the golden fixtures: the case lists and the functions that compute a case from the GUI.
 
+The fixtures are a migration tool. PR 2 compares isotile against them and records the intended differences in the
+tests; it then replaces them by a smaller set regenerated from the ported code and deletes ``make_golden.py``.
+
 The fixtures in ``tests/data`` were written by ``tests/make_golden.py`` from the current implementation (carto-flow
 2.0.0 with tactile 0.1.0). The tests compute the same quantities from the code under test and compare them with the
 fixtures. Only this module and ``make_golden.py`` touch the GUI classes; the tests compare plain numbers and text.
@@ -9,7 +12,6 @@ from __future__ import annotations
 
 import json
 import re
-from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,6 +44,11 @@ def type_numbers() -> list[int]:
 def case_ids() -> list[str]:
     """The 96 cases: ``preset:<name>`` for the 15 presets and ``type:<n>`` for the 81 types at their defaults."""
     return [f"preset:{n}" for n in preset_names()] + [f"type:{n}" for n in type_numbers()]
+
+
+def text_case_ids() -> list[str]:
+    """Cases whose Python snippet and JSON export are stored: the 15 presets and every eighth type (11 types)."""
+    return [f"preset:{n}" for n in preset_names()] + [f"type:{n}" for n in type_numbers()[::8]]
 
 
 def make_state(case: str):
@@ -90,26 +97,6 @@ def tile_arrays(result) -> dict[str, np.ndarray]:
 
 def preview_case(case: str) -> dict[str, np.ndarray]:
     return tile_arrays(preview_call(make_state(case)))
-
-
-def strip_png(state) -> np.ndarray:
-    """The strip of ``PreviewStrip._render_strip_png`` as a grayscale uint8 array (uniform color mode)."""
-    import matplotlib.image as mpimg
-
-    from isohedral_tiling_ui.components.preview_strip import PreviewStrip
-
-    state.face_color_mode = "uniform"
-    data = PreviewStrip(state=state)._render_strip_png()
-    img = mpimg.imread(BytesIO(data), format="png")
-    gray = img[..., :3].mean(axis=-1)
-    return np.round(gray * 255).astype(np.uint8)
-
-
-def pixel_difference(a: np.ndarray, b: np.ndarray) -> float:
-    """Share of pixels that differ by more than 0.05 in intensity; 1.0 if the shapes differ."""
-    if a.shape != b.shape:
-        return 1.0
-    return float(np.mean(np.abs(a.astype(float) - b.astype(float)) / 255 > 0.05))
 
 
 def _numbers(text: str) -> list[float]:

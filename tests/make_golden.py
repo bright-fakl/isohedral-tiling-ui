@@ -6,9 +6,9 @@ Run once in an environment with the pinned carto-flow and tactile (see ``ci/cons
 
 Outputs (all in ``tests/data``):
     designs/*.json         design files of the kinds the GUI writes or has to survive
-    golden_preview.npz     per case (81 types, 15 presets): tiles of the preview call; per preset: the strip image
+    golden_preview.npz     per case (81 types, 15 presets): tiles of the preview call
     golden_exports.npz     SVG and GeoJSON summaries of the 15 presets at 50, 100 and 200 tiles
-    golden_text.json       Python snippet and JSON of the export dialog per case, PNG sizes, loaded-file results,
+    golden_text.json       Python snippet and JSON of the export dialog (15 presets, 11 types), PNG sizes, loaded-file results,
                            versions of the libraries that produced the fixtures
 """
 
@@ -136,8 +136,6 @@ def main() -> None:
     for case in cases:
         for key, val in g.preview_case(case).items():
             arrays[f"{case}/{key}"] = val
-    for name in g.preset_names():
-        arrays[f"strip/{name}"] = g.strip_png(g.make_state(f"preset:{name}"))
     np.savez_compressed(g.DATA / "golden_preview.npz", **arrays)
 
     exp_arrays: dict[str, np.ndarray] = {}
@@ -157,7 +155,7 @@ def main() -> None:
     text = {
         "versions": {p: version(p) for p in ("carto-flow", "tactile", "numpy", "shapely", "matplotlib", "svgwrite")},
         "cases": cases,
-        "text_exports": {case: g.text_exports(case) for case in cases},
+        "text_exports": {case: g.text_exports(case) for case in g.text_case_ids()},
         "exports": exp_text,
         "loaded": {f.stem: g.load_design(f.read_text()) for f in g.design_files()},
     }

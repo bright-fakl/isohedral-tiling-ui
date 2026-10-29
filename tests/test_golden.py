@@ -1,7 +1,9 @@
 """Golden tests: the current GUI against fixtures that the current implementation wrote.
 
-The fixtures (``tests/data``) record the behavior of the GUI before the port to isotile: the tiles of the preview, the
-strip image, the SVG and GeoJSON exports, the Python snippet and JSON export, and the result of loading design files.
+The fixtures (``tests/data``) record the behavior of the GUI before the port to isotile: the tiles of the preview,
+the SVG and GeoJSON exports, the Python snippet and JSON export, and the result of loading design files.
+The fixtures are a migration tool: PR 2 compares isotile against them, records the intended differences in the test,
+then replaces them by a smaller set regenerated from the ported code and deletes ``make_golden.py``.
 Regenerate them only on purpose, with ``python -m tests.make_golden`` in an environment with the pinned libraries.
 """
 
@@ -80,13 +82,6 @@ def test_preview_tiles(case, preview_fx):
             assert np.allclose(val, want, rtol=0, atol=ATOL), key
 
 
-@pytest.mark.parametrize("name", PRESETS)
-def test_strip_image(name, preview_fx):
-    got = g.strip_png(g.make_state(f"preset:{name}"))
-    # Anti-aliasing differs between matplotlib versions; the shapes must agree to within 2 percent of the pixels.
-    assert g.pixel_difference(got, preview_fx[f"strip/{name}"]) <= 0.02
-
-
 # ----------------------------------------------------------------------------------------------------------------------
 # Exports
 
@@ -116,7 +111,7 @@ def test_png_export_size(case, size, text_fx):
     assert list(g.png_export_size(case, size)) == text_fx["exports"][f"{case}/{size}"]["png_size"]
 
 
-@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize("case", g.text_case_ids())
 def test_python_snippet_and_json_export(case, text_fx):
     got = g.text_exports(case)
     want = text_fx["text_exports"][case]
