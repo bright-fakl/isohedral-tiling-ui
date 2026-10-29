@@ -9,6 +9,9 @@ on:
 
 env:
   MPLBACKEND: Agg
+  # Hugging Face Spaces (Docker SDK). Change the names here only.
+  HF_SPACE_LIVE: devfakl/isohedral-tiling-ui
+  HF_SPACE_STAGING: devfakl/isohedral-tiling-ui-staging
 
 jobs:
   lint:
@@ -78,3 +81,86 @@ jobs:
           uv run --no-sync playwright install --with-deps chromium
       - name: pytest (browser)
         run: uv run --no-sync pytest -q tests/browser
+
+  docker:
+    name: docker build and smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image from the Dockerfile
+        run: docker build -t isotile-ui:ci .
+      - name: Run the container and wait for the app
+        run: |
+          docker run -d --name app -p 7860:7860 isotile-ui:ci
+          tries=0
+          until [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:7860/app)" = "200" ]; do
+            tries=$((tries + 1))
+            if [ "$tries" -gt 60 ]; then
+              echo "::error::the app did not answer HTTP 200 on port 7860 within 120 s"
+              docker logs app
+              exit 1
+            fi
+            if [ -z "$(docker ps -q -f name=app)" ]; then
+              echo "::error::the container exited"
+              docker logs app
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "HTTP 200 after $tries retries"
+      - name: Check the log for a traceback
+        run: |
+          docker logs app 2>&1 | tee container.log
+          if grep -q "Traceback" container.log; then
+            echo "::error::the container log contains a traceback"
+            exit 1
+          fi
+      - name: Stop the container
+        if: always()
+        run: docker rm -f app
+
+  staging-skip:
+    name: staging sync (skipped for forks)
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "::notice::Secrets are not available to pull requests from forks, so the staging Space was not updated."
+
+  staging:
+    name: staging Space sync
+    # Same-repository pull requests only. The staging Space shows the last pull request that was synced.
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    needs: [lint, tests, browser, docker]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: staging-space
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Push the snapshot to the staging Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: ci/sync_space.sh "$HF_SPACE_STAGING" "${{ github.event.pull_request.head.sha }}"
+
+  live:
+    name: live Space sync
+    # Only after every CI job has passed for this commit.
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [lint, tests, browser, docker]
+    runs-on: ubuntu-latest
+    environment: live
+    concurrency:
+      group: live-space
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Push the snapshot to the live Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: ci/sync_space.sh "$HF_SPACE_LIVE" "$GITHUB_SHA"

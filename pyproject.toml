@@ -5,7 +5,7 @@ description = "Interactive Panel/Bokeh UI for designing isohedral tilings."
 authors = [{ name = "FKloosterman", email = "devfakl@gmail.com" }]
 readme = "README.md"
 license = { file = "LICENSE" }
-keywords = ["tiling", "isohedral", "panel", "cartogram"]
+keywords = ["tiling", "isohedral", "panel", "tessellation"]
 requires-python = ">=3.10,<4.0"
 classifiers = [
     "Intended Audience :: Developers",
@@ -33,6 +33,9 @@ isohedral-tiling-ui = "isohedral_tiling_ui:launch_ui"
 
 [project.urls]
 Repository = "https://github.com/bright-fakl/isohedral-tiling-ui"
+Issues = "https://github.com/bright-fakl/isohedral-tiling-ui/issues"
+App = "https://devfakl-isohedral-tiling-ui.hf.space/"
+isotile = "https://github.com/bright-fakl/isotile"
 
 [dependency-groups]
 dev = [
