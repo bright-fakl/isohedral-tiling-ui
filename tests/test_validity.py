@@ -9,7 +9,7 @@ from isotile import check_prototile, get_type
 from isohedral_tiling_ui import editor_model as em
 from isohedral_tiling_ui.components import CurveEditor, PrototileEditor, StatusLine
 from isohedral_tiling_ui.components.probe import ProbeChannel
-from isohedral_tiling_ui.editor_model import Draft, slider_limits
+from isohedral_tiling_ui.editor_model import Draft, edge_local_coordinates, placed_curve, slider_limits
 from isohedral_tiling_ui.state import TilingState, Validity
 from isohedral_tiling_ui.utils.curve_presets import get_curve_preset, list_curve_presets
 
@@ -193,17 +193,152 @@ def test_status_line_shows_the_message(state):
     assert line._pane.object == "&nbsp;"
 
 
+def panel_widgets(editor: PrototileEditor, kind: type) -> list:
+    """The widgets of a type in the parameter panel, in order."""
+    found = []
+
+    def walk(obj) -> None:
+        if isinstance(obj, kind):
+            found.append(obj)
+        for child in getattr(obj, "objects", []) or []:
+            walk(child)
+
+    walk(editor._build_parameter_panel())
+    return found
+
+
 def test_slider_track_marks_the_invalid_part_and_the_slider_cannot_leave_the_valid_interval(state):
+    import panel as pn
+
     editor = PrototileEditor(state=state)
     state.load_type(30)
-    sliders = [o for o in editor._build_parameter_panel().objects if hasattr(o, "value_throttled")]
-    assert len(sliders) == 1
-    slider = sliders[0]
+    (slider,) = panel_widgets(editor, pn.widgets.FloatSlider)
     css = slider.stylesheets[0]
-    assert "linear-gradient" in css and "48.7%" in css  # the track is marked from the limit to the end
+    hi_fraction = editor._valid_fractions(state.parameter_ranges(0)[0])[1]
+    assert "linear-gradient" in css and f"{hi_fraction * 100:.1f}%" in css  # marked from the limit to the end
+    assert 0.48 < hi_fraction < 0.53
     slider.value = 0.9  # an excluded value
     assert slider.value == pytest.approx(0.487, abs=2e-3)
     assert state.draft.report().valid and state.validity is None
+
+
+def test_the_slider_window_reaches_beyond_one_where_the_prototile_is_valid(state):
+    import panel as pn
+
+    editor = PrototileEditor(state=state)
+    state.load_preset("flowers")  # IH21 with curves: valid from -0.04 and from 0.18 upward, no upper limit
+    ranges = state.parameter_ranges(0)
+    assert ranges[0].valid_lo == pytest.approx(-0.0456, abs=2e-3) and ranges[0].open_hi
+    assert ranges[1].open_hi
+    below = list(state.parameters)
+    below[1] = ranges[1].valid_lo - 0.005
+    above = list(state.parameters)
+    above[1] = ranges[1].valid_lo + 0.005
+    assert not state.draft.with_parameters(below).report().valid  # a hard minimum
+    assert state.draft.with_parameters(above).report().valid
+    assert ranges[0].window_lo == pytest.approx(-0.05) and ranges[0].window_hi == pytest.approx(2.0)
+    sliders = panel_widgets(editor, pn.widgets.FloatSlider)
+    assert (sliders[1].start, sliders[1].end) == pytest.approx((0.0, 2.0))
+    editor.zoom = 2  # the window is searched up to 5
+    sliders = panel_widgets(editor, pn.widgets.FloatSlider)
+    assert sliders[1].end == pytest.approx(5.0)
+    state.load_type(30)  # a new type resets the zoom
+    assert editor.zoom == 0
+
+
+def test_a_value_typed_in_the_field_is_applied_if_valid_and_refused_otherwise(state, notes):
+    import panel as pn
+
+    editor = PrototileEditor(state=state)
+    state.load_preset("flowers")
+    field = panel_widgets(editor, pn.widgets.FloatInput)[1]
+    field.value = 2.5  # beyond the old range 0 to 1, valid
+    assert state.parameters[1] == pytest.approx(2.5)
+    field = panel_widgets(editor, pn.widgets.FloatInput)[1]
+    before = state.draft
+    field.value = 0.05  # below the limit 0.18
+    assert state.draft is before
+    assert notes.events and "Not applied" in notes.events[-1][1]
+
+
+def test_the_vertex_drag_clamps_to_the_window_of_the_slider(state):
+    editor = PrototileEditor(state=state)
+    state.load_preset("flowers")
+    window = editor._ranges()[1]
+    editor._on_probe({"idx": [1], "dp": [100.0]})  # far beyond the window
+    assert state.validity is None or state.validity.bad_edges is not None
+    assert max(state.parameters[1], window.window_hi) == window.window_hi
+    import json
+
+    windows = json.loads(editor._jacobian_source.data["windows"][0])
+    assert windows["1"] == pytest.approx([window.window_lo, window.window_hi])
+
+
+# -- curved edges ------------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("preset", ["flowers", "tree", "wavy_triangle", "puzzle_piece", "arrow_quad"])
+def test_placed_curve_reproduces_the_edge_outlines(preset):
+    from isotile import IsohedralTiling
+
+    draft = Draft.from_tiling(IsohedralTiling.from_preset(preset))
+    outlines = draft.tiling().edge_outlines()
+    for sid in sorted(set(draft.tiling().edge_shape_ids.tolist())):
+        placed = placed_curve(draft, int(sid), draft.curve(int(sid)))
+        assert placed
+        for i, (xs, ys) in placed.items():
+            assert np.allclose(np.c_[xs, ys], outlines[i], atol=1e-9)
+
+
+def test_placed_curve_is_available_for_a_curve_that_would_be_invalid():
+    draft = Draft.of(41)
+    placed = placed_curve(draft, 0, CROSSING)
+    assert set(placed) == {0, 2}  # both copies
+    assert not draft.with_curve(0, CROSSING).report().valid
+
+
+@pytest.mark.parametrize("preset", ["flowers", "tree", "wavy_triangle", "puzzle_piece"])
+def test_curved_edges_follow_moved_vertices_exactly(preset):
+    from isotile import IsohedralTiling
+
+    draft = Draft.from_tiling(IsohedralTiling.from_preset(preset))
+    tiling = draft.tiling()
+    if not len(draft.parameters):
+        pytest.skip("no parameters")
+    moved = draft.with_parameters([min(1.0, p + 0.03) for p in draft.parameters])
+    if not moved.report().valid:
+        pytest.skip("moved draft invalid")
+    local = edge_local_coordinates(tiling)
+    verts = np.asarray(moved.tiling().vertices)
+    for i, expected in enumerate(moved.tiling().edge_outlines()):
+        a, b = verts[i], verts[(i + 1) % len(verts)]
+        d = b - a
+        s_t = np.asarray(local[i])
+        pts = a + s_t[:, :1] * d + s_t[:, 1:] * np.array([-d[1], d[0]])
+        assert np.allclose(pts, expected, atol=1e-5)
+
+
+def test_the_probe_sends_the_dragged_outline_to_the_prototile_editor(state):
+    editor = PrototileEditor(state=state)
+    state.load_type(41)
+    state.probe_curve(0, CROSSING)
+    xs = editor._curved_source.data["xs"]
+    assert set(state.live_outline) == {0, 2}
+    assert xs[0] == state.live_outline[0][0] and xs[2] == state.live_outline[2][0]
+    state.set_curve(0, get_curve_preset("scalloped"), "ok")  # a commit redraws from the draft
+    assert state.live_outline is None
+
+
+def test_red_is_on_the_curved_edges_of_the_shape_id(state):
+    editor = PrototileEditor(state=state)
+    state.load_type(41)
+    state.probe_curve(0, CROSSING)
+    colors = editor._curved_source.data["line_color"]
+    ids = state.tiling.edge_shape_ids.tolist()
+    assert [c == "#d62728" for c in colors] == [i == 0 for i in ids]
+    assert not editor._bad_straight.visible  # the straight guide is not drawn red while the curves are shown
+    editor.show_curves = False
+    assert editor._bad_straight.visible and not editor._curved_renderer.visible
 
 
 # -- the probe channel -----------------------------------------------------------------------------------------------

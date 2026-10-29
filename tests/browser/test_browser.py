@@ -14,6 +14,7 @@ import time
 import urllib.request
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from isohedral_tiling_ui.utils.curve_presets import list_curve_presets
@@ -285,6 +286,21 @@ class App:
         shown["status"] = self.page.get_by_text("Invalid:").count() > 0
         shown["red_edges"] = sum(sum(b) for b in shown["bad"])
         return shown
+
+    def curved_edges(self) -> dict:
+        """Colors, first and last points and a middle point of the curved edges of the prototile editor."""
+        return self.js(
+            """() => {
+            const all = [...Bokeh.documents[0].all_models];
+            const c = all.find(m => m.type === 'ColumnDataSource' && m.data.xs && m.data.line_width && m.data.edge_idx);
+            const poly = all.find(m => m.type === 'ColumnDataSource' && m.data.xs && m.data.xs.length === 1
+                && m.data.xs[0].length > 3);
+            const ends = c.data.xs.map((xs, i) => [[xs[0], c.data.ys[i][0]], [xs[xs.length - 1], c.data.ys[i][xs.length - 1]]]);
+            const mid = c.data.xs.map((xs, i) => [xs[xs.length >> 1], c.data.ys[i][xs.length >> 1]]);
+            return {colors: Array.from(c.data.line_color), ends: ends, mid: mid,
+                    polygon: Array.from(poly.data.xs[0], (x, i) => [x, poly.data.ys[0][i]])};
+            }"""
+        )
 
     def toasts(self) -> list[str]:
         return self.page.get_by_text("Not applied").all_inner_texts()
@@ -717,3 +733,96 @@ def test_probe_round_trip_is_measured(app):
     median = sorted(log)[len(log) // 2]
     print(f"probe round trip: n={len(log)} median {median:.0f} ms, max {max(log):.0f} ms")
     assert median < 500
+
+
+def test_the_curved_edges_follow_a_vertex_drag_live(app):
+    app.click_model(app.button("tile:flowers"))
+    app.wait_for(lambda: app.marked("tile"), ["flowers"])
+    start = app.curved_edges()
+    handles = app.vertices()
+    drag_and_hold(app, handles["px"][0], handles["py"][0], [(10, -10), (25, -20)])
+    live = app.curved_edges()  # the mouse is still pressed
+    assert live["mid"] != start["mid"]  # the curves moved with the vertices
+    for ends, (a, b) in zip(live["ends"], zip(live["polygon"], live["polygon"][1:], strict=False), strict=False):
+        assert ends[0] == pytest.approx(a, abs=1e-6) and ends[1] == pytest.approx(b, abs=1e-6)  # attached
+    app.page.mouse.up()
+    app.wait_for(app.undo_count, 1)
+    final = app.curved_edges()  # after the release the outline is that of the new draft
+    assert np.allclose(final["mid"], live["mid"], atol=1e-3)
+
+
+def test_the_curved_edges_follow_a_node_drag_live(app):
+    app.click_model(app.button("tile:flowers"))
+    app.wait_for(lambda: app.marked("tile"), ["flowers"])
+    start = app.curved_edges()
+    nodes = app.curve_nodes()
+    drag_and_hold(app, nodes["px"][0], nodes["py"][0], [(0, -10), (0, -40)])
+    live = app.curved_edges()
+    assert live["mid"][0] != start["mid"][0]  # edge 0 follows the dragged curve
+    assert live["mid"][1:] == start["mid"][1:]  # the other shape ids are untouched
+    app.page.mouse.up()
+    app.wait_for(lambda: bool(np.allclose(app.curved_edges()["mid"][0], live["mid"][0], atol=1e-3)), True)
+
+
+def test_invalid_curved_edges_are_red_for_every_copy(app):
+    app.click_text("Tiling Type")
+    app.click_model(app.button("type:41"))
+    app.wait_for(lambda: app.marked("type"), ["41"])
+    app.click_preset("scalloped")
+    nodes = app.curve_nodes()
+    drag_and_hold(app, nodes["px"][1], nodes["py"][1], [(40, 0), (110, 0)])
+    colors = app.curved_edges()["colors"]
+    red = colors.count("#d62728")
+    assert red >= 2 and red % 2 == 0  # every copy of each shape id that the check names (two edges per id here)
+    assert red == app.validity()["red_edges"]  # the same edges as the hidden straight overlay
+    app.page.mouse.up()
+    app.wait_for(lambda: "#d62728" in app.curved_edges()["colors"], False)  # cleared after the hold
+
+
+def slider_values(app) -> list[float]:
+    return app.js(
+        "() => [...Bokeh.documents[0].all_models].filter(m => m.type === 'Slider' && m.step && Bokeh.index.find_one(m)).map(m => m.value)"
+    )
+
+
+def slider_windows(app) -> list[list[float]]:
+    return app.js(
+        "() => [...Bokeh.documents[0].all_models].filter(m => m.type === 'Slider' && m.step && Bokeh.index.find_one(m)).map(m => [m.start, m.end])"
+    )
+
+
+def type_in_field(app, k: int, text: str) -> None:
+    """Type into the k-th numeric field of the parameter sliders and press Enter."""
+    app.page.wait_for_function(
+        """(k) => { const m = [...Bokeh.documents[0].all_models].filter(m => m.type === 'Spinner' && Bokeh.index.find_one(m))[k];
+        return m && Bokeh.index.find_one(m); }""",
+        arg=k,
+    )
+    x, y = app.js(
+        """(k) => {
+        const m = [...Bokeh.documents[0].all_models].filter(m => m.type === 'Spinner' && Bokeh.index.find_one(m))[k];
+        const r = Bokeh.index.find_one(m).el.getBoundingClientRect();
+        return [r.x + r.width / 2, r.y + r.height / 2];
+        }""",
+        k,
+    )
+    app.page.mouse.click(x, y)
+    app.page.keyboard.press("Control+A")
+    app.page.keyboard.type(text)
+    app.page.keyboard.press("Enter")
+
+
+def test_a_parameter_can_be_typed_beyond_the_old_range_and_the_window_follows(app):
+    app.click_model(app.button("tile:flowers"))
+    app.wait_for(lambda: app.marked("tile"), ["flowers"])
+    assert slider_windows(app)[1] == pytest.approx([0.0, 2.0])  # valid beyond 1: the window reaches 2
+    type_in_field(app, 1, "1.6")
+    app.wait_for(lambda: round(slider_values(app)[1], 2), 1.6)
+    type_in_field(app, 1, "0.05")  # below the minimum 0.165: refused, the value stays
+    time.sleep(1.0)
+    assert slider_values(app)[1] == pytest.approx(1.6)
+    assert any("Not applied" in t for t in app.toasts())
+    app.page.get_by_role("button", name="Zoom out x2").click()
+    app.wait_for(lambda: slider_windows(app)[1][1] >= 3.0, True)
+    app.page.get_by_role("button", name="Zoom reset").click()
+    app.wait_for(lambda: slider_windows(app)[1][1] >= 1.6, True)  # the window still holds the value

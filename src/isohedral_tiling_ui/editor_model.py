@@ -32,6 +32,7 @@ from isotile import (
     check_prototile,
     enforce_symmetry,
     get_type,
+    interpolate,
 )
 
 from isohedral_tiling_ui.utils.curve_presets import get_curve_preset, list_curve_presets
@@ -352,6 +353,94 @@ def edge_shape_ids(type_number: int, edges: Any) -> tuple[int, ...]:
     """The distinct shape ids of the edges (indices into the outline) of a type, ascending."""
     ids = get_type(type_number).edge_shape_ids
     return tuple(sorted({int(ids[i]) for i in edges}))
+
+
+@dataclass(frozen=True)
+class ParameterRange:
+    """The values of one parameter: where the prototile stays valid, and the window that a slider shows."""
+
+    valid_lo: float
+    valid_hi: float
+    window_lo: float
+    window_hi: float
+    open_lo: bool  # valid down to the end of the search range, which is not a limit of the parameter
+    open_hi: bool
+
+
+def parameter_ranges(draft: Draft, zoom: int = 0) -> tuple[ParameterRange, ...]:
+    """The valid interval around the current value and the slider window of every parameter.
+
+    The interval is searched in ``-2**zoom`` to ``1 + 2**zoom`` (wider if the value is outside). The window is
+    ``0`` to ``1`` extended to the valid interval: it contains the part of the interval that the search found, so a
+    parameter that is valid beyond 1 can be set there, and a limit inside 0 to 1 shows as the end of the valid part of
+    the track.
+    """
+    return _parameter_ranges(draft, zoom)
+
+
+def _round_out(value: float, direction: int, step: float = 0.05) -> float:
+    """``value`` rounded outward (down for -1, up for 1) to a multiple of ``step``, for a window with round ends."""
+    n = value / step
+    return round((np.floor(n + 1e-9) if direction < 0 else np.ceil(n - 1e-9)) * step, 10)
+
+
+@lru_cache(maxsize=128)
+def _parameter_ranges(draft: Draft, zoom: int) -> tuple[ParameterRange, ...]:
+    span = 2.0**zoom
+    out = []
+    for k, v in enumerate(draft.parameters):
+        lo_search, hi_search = min(-span, v), max(1.0 + span, v)
+        lo, hi = _slider_limits(draft, k, (lo_search, hi_search), 21, 1e-3)
+        out.append(
+            ParameterRange(
+                lo,
+                hi,
+                _round_out(min(0.0, lo), -1),
+                _round_out(max(1.0, hi), 1),
+                lo <= lo_search + 1e-9,
+                hi >= hi_search - 1e-9,
+            )
+        )
+    return tuple(out)
+
+
+def placed_curve(draft: Draft, shape_id: int, curve: Any) -> dict[int, tuple[list[float], list[float]]]:
+    """The polyline of ``curve`` on every edge of ``shape_id``, in world coordinates of the draft's prototile.
+
+    The placement depends only on the vertices (the edge transforms of the draft's tiling), so it is available for a
+    curve that would make the prototile invalid. Maps the edge index to ``(xs, ys)``.
+    """
+    tiling = draft.tiling()
+    polyline = interpolate(curve, draft.mode(shape_id))
+    out = {}
+    for i, sid in enumerate(tiling.edge_shape_ids.tolist()):
+        if sid != shape_id:
+            continue
+        t = np.asarray(tiling.edge_transforms[i])
+        pts = polyline @ t[:, :2].T + t[:, 2]
+        if tiling.edge_reversed[i]:
+            pts = pts[::-1]
+        out[i] = (pts[:, 0].tolist(), pts[:, 1].tolist())
+    return out
+
+
+def edge_local_coordinates(tiling: IsohedralTiling) -> list[list[list[float]]]:
+    """Each edge outline as ``(s, t)`` relative to its chord: ``p = A + s (B - A) + t J (B - A)``, ``J`` a quarter turn.
+
+    The outline of an edge is a similarity image of the canonical curve, so these coordinates stay valid when the
+    vertices ``A`` and ``B`` move: the curved edges can follow a vertex drag without a new tiling.
+    """
+    verts = np.asarray(tiling.vertices)
+    out = []
+    for i, pts in enumerate(tiling.edge_outlines()):
+        a, b = verts[i], verts[(i + 1) % len(verts)]
+        d = b - a
+        norm = float(d @ d) or 1.0
+        rel = np.asarray(pts) - a
+        s = rel @ d / norm
+        t = rel @ np.array([-d[1], d[0]]) / norm
+        out.append(np.c_[s, t].round(7).tolist())
+    return out
 
 
 def slider_limits(

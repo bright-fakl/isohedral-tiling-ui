@@ -20,9 +20,12 @@ from isohedral_tiling_ui.editor_model import (
     DEFAULT_PRESET,
     Draft,
     EditorModel,
+    ParameterRange,
     add_node,
     edge_shape_ids,
     move_node,
+    parameter_ranges,
+    placed_curve,
     remove_node,
     shape_of,
     slider_limits,
@@ -93,6 +96,9 @@ class TilingState(param.Parameterized):
     source_label = param.String(default=DEFAULT_PRESET, doc="Preset name or file description; stem of file names")
     active_curve_id = param.Integer(default=None, allow_None=True)
     view = param.ClassSelector(class_=ViewSettings, constant=True)
+    live_outline = param.Parameter(
+        default=None, doc="Edge index -> (xs, ys): the curve being dragged, placed on its edges (not committed)"
+    )
     validity = param.ClassSelector(
         class_=Validity, default=None, allow_None=True, doc="The invalid draft that is shown (probe or refused edit)"
     )
@@ -206,7 +212,9 @@ class TilingState(param.Parameterized):
     def probe_curve(self, shape_id: int, points: Any) -> bool:
         """Probe a curve of a shape id (control points as dragged; the symmetry is enforced)."""
         curve = enforce_symmetry(points, self.shape_type(shape_id))
-        return self.probe(self.draft.with_curve(shape_id, curve))
+        valid = self.probe(self.draft.with_curve(shape_id, curve))
+        self.live_outline = placed_curve(self.draft, shape_id, curve)
+        return valid
 
     def probe_parameters(self, values: Any) -> bool:
         return self.probe(self.draft.with_parameters(values))
@@ -214,6 +222,10 @@ class TilingState(param.Parameterized):
     def parameter_limits(self) -> list[tuple[float, float]]:
         """The interval of each parameter in 0 to 1 in which the draft stays valid (``slider_limits``)."""
         return [slider_limits(self.draft, k) for k in range(len(self.draft.parameters))]
+
+    def parameter_ranges(self, zoom: int = 0) -> tuple[ParameterRange, ...]:
+        """Valid interval and slider window of every parameter, see ``editor_model.parameter_ranges``."""
+        return parameter_ranges(self.draft, zoom)
 
     def clear_validity(self, token: int | None = None) -> None:
         """Stop showing an invalid draft (a hold that was superseded by a newer display is not cleared)."""
@@ -285,6 +297,7 @@ class TilingState(param.Parameterized):
         self.notify("error", f"Not applied ({label}): {validity.describe()}")
         # The views may show the refused input; redraw them from the current draft
         self.param.trigger("draft", "parameters", "edge_curve_modes")
+        self.live_outline = None
         self._hold_validity(validity)
         return False
 
@@ -316,6 +329,7 @@ class TilingState(param.Parameterized):
         if source_label is not None:
             updates["source_label"] = source_label
         self._show_validity(None)
+        updates["live_outline"] = None
         self.param.update(**updates)
         if same:
             self.param.trigger("draft", "parameters", "edge_curve_modes")

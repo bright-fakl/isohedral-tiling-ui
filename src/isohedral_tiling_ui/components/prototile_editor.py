@@ -8,7 +8,7 @@ from bokeh.models import BooleanFilter, CDSView, ColumnDataSource, CustomJS, Lab
 from bokeh.plotting import figure
 
 from isohedral_tiling_ui.components.probe import ProbeChannel
-from isohedral_tiling_ui.editor_model import parameter_groups
+from isohedral_tiling_ui.editor_model import edge_local_coordinates, parameter_groups
 
 INVALID_COLOR = "#d62728"  # the edges that make the prototile invalid
 INVALID_TRACK = "rgba(214, 39, 40, 0.35)"  # the part of a slider track with invalid values
@@ -20,6 +20,7 @@ class PrototileEditor(pn.viewable.Viewer):
     state = param.ClassSelector(class_=param.Parameterized)
     show_curves = param.Boolean(default=True)
     active_param_group = param.Integer(default=0)
+    zoom = param.Integer(default=0, bounds=(0, 4), doc="The slider windows reach 2**zoom beyond 0 to 1 where valid")
 
     def __init__(self, **params):
         super().__init__(**params)
@@ -31,8 +32,10 @@ class PrototileEditor(pn.viewable.Viewer):
         self._outline_source = ColumnDataSource(data={"xs": [], "ys": []})
         self._edge_source = ColumnDataSource(data={"xs": [], "ys": [], "edge_idx": [], "shape_type": []})
         self._edge_label_source = ColumnDataSource(data={"x": [], "y": [], "text": [], "shape_type": []})
-        self._curve_sources = {}
-        self._curve_renderers = []  # Store line renderers for removal
+        # The curved edges (one polyline per edge); the straight polygon above is a faint guide for the handles
+        self._curved_source = ColumnDataSource(
+            data={"xs": [], "ys": [], "edge_idx": [], "line_color": [], "line_width": []}
+        )
         # Flag to prevent feedback loop between JS and Python callbacks
         self._in_drag = False
         self._primary_dragged = -1  # Track which vertex is being primarily dragged
@@ -69,13 +72,17 @@ class PrototileEditor(pn.viewable.Viewer):
 
         # Edge lines (individual segments for labeling)
         p.multi_line("xs", "ys", source=self._edge_source, line_color="line_color", line_width=1.5)
-        p.multi_line(
+        # The straight edges that make the prototile invalid, in red; only shown while the curves are hidden
+        self._bad_straight = p.multi_line(
             "xs",
             "ys",
             source=self._edge_source,
             view=CDSView(filter=self._bad_filter),
             line_color=INVALID_COLOR,
             line_width=3.5,
+        )
+        self._curved_renderer = p.multi_line(
+            "xs", "ys", source=self._curved_source, line_color="line_color", line_width="line_width"
         )
 
         # Fixed vertices (no tool attached - not draggable)
@@ -193,6 +200,8 @@ class PrototileEditor(pn.viewable.Viewer):
                 "orig_x": ["[]"],
                 "orig_y": ["[]"],
                 "values": ["{}"],
+                "windows": ["{}"],
+                "edge_local": ["[]"],
             }
         )
 
@@ -244,6 +253,7 @@ class PrototileEditor(pn.viewable.Viewer):
                     "fixed": self._fixed_source,
                     "outline": self._outline_source,
                     "edge_source": self._edge_source,
+                    "curved": self._curved_source,
                     "edge_labels": self._edge_label_source,
                     "jacobian_source": self._jacobian_source,
                     "probe_in": self._probe.in_source,
@@ -258,12 +268,6 @@ class PrototileEditor(pn.viewable.Viewer):
             const n = dx.length;
             if (n < 1) return;
 
-            // Hide thick curves during drag
-            for (let i = 0; i < fig.renderers.length; i++) {
-                const r = fig.renderers[i];
-                if (r.name === 'thick_curve') r.visible = false;
-            }
-
             // Get Jacobian data
             let jac = {};
             let params = [];
@@ -271,6 +275,8 @@ class PrototileEditor(pn.viewable.Viewer):
             let orig_x = [];
             let orig_y = [];
             let pvals = {};
+            let windows = {};
+            let edge_local = [];
             try {
                 jac = JSON.parse(jacobian_source.data.jacobian[0]);
                 params = JSON.parse(jacobian_source.data.group_params[0]);
@@ -278,6 +284,8 @@ class PrototileEditor(pn.viewable.Viewer):
                 orig_x = JSON.parse(jacobian_source.data.orig_x[0]);
                 orig_y = JSON.parse(jacobian_source.data.orig_y[0]);
                 pvals = JSON.parse(jacobian_source.data.values[0]);
+                windows = JSON.parse(jacobian_source.data.windows[0]);
+                edge_local = JSON.parse(jacobian_source.data.edge_local[0]);
             } catch (e) {}
 
             // Compute displacements from the true pre-drag vertex positions stored in
@@ -438,11 +446,11 @@ class PrototileEditor(pn.viewable.Viewer):
                     if (Math.abs(aug[i][i]) > 1e-12) dp[i] /= aug[i][i];
                 }
 
-                // A parameter stays in 0 to 1, the range of the sliders. The values inside the range at which the
+                // A parameter stays in the window of its slider. The values inside the window at which the
                 // prototile is invalid are reached, shown in red and refused at the release.
                 for (let j = 0; j < n_params; j++) {
-                    const v0 = pvals[params[j]];
-                    if (v0 !== undefined) dp[j] = Math.min(1, Math.max(0, v0 + dp[j])) - v0;
+                    const v0 = pvals[params[j]], w = windows[params[j]];
+                    if (v0 !== undefined && w !== undefined) dp[j] = Math.min(w[1], Math.max(w[0], v0 + dp[j])) - v0;
                 }
                 """
                 + self._probe.send_js("{idx: params, dp: dp}")
@@ -535,6 +543,28 @@ class PrototileEditor(pn.viewable.Viewer):
             }
             edge_source.data = {xs: edge_xs, ys: edge_ys, edge_idx: edge_idx,
                                  shape_type: shape_type, line_color: line_color};
+
+            // The curved edges follow the vertices: each outline is a similarity image of the canonical curve, so its
+            // (s, t) coordinates relative to the chord stay valid when the end vertices move (exact, not predicted).
+            if (edge_local.length === total) {
+                const cxs = [], cys = [];
+                for (let i = 0; i < total; i++) {
+                    const next = (i + 1) % total;
+                    const ax = all_x[i], ay = all_y[i];
+                    const ddx = all_x[next] - ax, ddy = all_y[next] - ay;
+                    const loc = edge_local[i];
+                    const px = new Array(loc.length), py = new Array(loc.length);
+                    for (let k = 0; k < loc.length; k++) {
+                        px[k] = ax + loc[k][0] * ddx - loc[k][1] * ddy;
+                        py[k] = ay + loc[k][0] * ddy + loc[k][1] * ddx;
+                    }
+                    cxs.push(px);
+                    cys.push(py);
+                }
+                const cd = curved.data;
+                curved.data = {xs: cxs, ys: cys, edge_idx: cd.edge_idx, line_color: cd.line_color,
+                               line_width: cd.line_width};
+            }
 
             const label_x = [];
             const label_y = [];
@@ -671,6 +701,8 @@ class PrototileEditor(pn.viewable.Viewer):
             "orig_x": [orig_x_json],
             "orig_y": [orig_y_json],
             "values": [json.dumps(dict(enumerate(self.state.parameters)))],
+            "windows": [json.dumps({k: [r.window_lo, r.window_hi] for k, r in enumerate(self._ranges())})],
+            "edge_local": [json.dumps(edge_local_coordinates(tiling))],
         }
 
         # Update outline
@@ -700,8 +732,10 @@ class PrototileEditor(pn.viewable.Viewer):
                 shape_types.append("?")
                 label_text.append(f"E{i}")
 
-            # Set line color based on active curve
-            if i < len(edge_info) and active_curve_id is not None and edge_info[i].get("shape_id") == active_curve_id:
+            # The straight edges are a faint guide while the curves are drawn
+            if self.show_curves:
+                line_colors.append("#ddd")
+            elif i < len(edge_info) and active_curve_id is not None and edge_info[i].get("shape_id") == active_curve_id:
                 line_colors.append("orange")
             else:
                 line_colors.append("#999")
@@ -762,57 +796,56 @@ class PrototileEditor(pn.viewable.Viewer):
             self._figure.y_range.start, self._figure.y_range.end = y_range
             self.state.reset_ranges = False  # Reset the flag
 
-        if self.show_curves:
-            self._update_edge_curves(tiling)
-        else:
-            # Ensure curves are hidden if show_curves is False
-            for renderer in self._curve_renderers:
-                renderer.visible = False
-        # Show curves if show_curves is True and we have renderers
-        if self.show_curves:
-            for renderer in self._curve_renderers:
-                renderer.visible = True
+        self._update_edge_curves(tiling)
+        self._curved_renderer.visible = self.show_curves
+        self._bad_straight.visible = not self.show_curves
 
         # Reset the flag
         self._in_drag = False
 
     def _update_edge_curves(self, tiling):
+        """The curved outline of every edge of the draft, with its style."""
         edges = tiling.edge_outlines()
-
-        # Rebuild renderers only when the edge count changes (tiling type switch).
-        # For same-type updates (curve drag, undo/redo within type) we reuse the
-        # existing renderers and only push new data into their sources, which avoids
-        # the Bokeh renderer-list mutation that causes visible blinking.
-        if len(self._curve_renderers) != len(edges):
-            for renderer in self._curve_renderers:
-                self._figure.renderers.remove(renderer)
-            self._curve_renderers.clear()
-            self._curve_sources.clear()
-            for edge_idx in range(len(edges)):
-                source = ColumnDataSource(data={"x": [], "y": []})
-                self._curve_sources[edge_idx] = source
-                renderer = self._figure.line("x", "y", source=source, name="thick_curve")
-                self._curve_renderers.append(renderer)
-
-        # Update data and style in place — no renderer add/remove, no blink.
-        for edge_idx, points in enumerate(edges):
-            self._curve_sources[edge_idx].data = {"x": points[:, 0].tolist(), "y": points[:, 1].tolist()}
-        self._style_curves()
+        colors, widths = self._curve_styles(tiling)
+        self._curved_source.data = {
+            "xs": [e[:, 0].tolist() for e in edges],
+            "ys": [e[:, 1].tolist() for e in edges],
+            "edge_idx": list(range(len(edges))),
+            "line_color": colors,
+            "line_width": widths,
+        }
 
     def _bad_shape_ids(self) -> set[int]:
         validity = self.state.validity
         return set(validity.shape_ids) if validity is not None else set()
 
-    def _style_curves(self) -> None:
-        """Color of the curve of each edge: red if its shape id makes the prototile invalid, orange if active."""
-        shape_ids = self.state.tiling.edge_shape_ids.tolist()
+    def _curve_styles(self, tiling) -> tuple[list[str], list[float]]:
+        """Color and width of each curved edge: red if its shape id makes the prototile invalid, orange if active."""
         bad = self._bad_shape_ids()
-        active_curve_id = self.state.active_curve_id
-        for renderer, shape_id in zip(self._curve_renderers, shape_ids, strict=False):
-            is_active = active_curve_id is not None and shape_id == active_curve_id
-            is_bad = shape_id in bad
-            renderer.glyph.line_color = INVALID_COLOR if is_bad else "#ff6600" if is_active else "#444"
-            renderer.glyph.line_width = 3.5 if is_bad else 3 if is_active else 2
+        active = self.state.active_curve_id
+        colors, widths = [], []
+        for shape_id in tiling.edge_shape_ids.tolist():
+            is_bad, is_active = shape_id in bad, active is not None and shape_id == active
+            colors.append(INVALID_COLOR if is_bad else "#ff6600" if is_active else "#444")
+            widths.append(3.5 if is_bad else 3 if is_active else 2)
+        return colors, widths
+
+    def _style_curves(self) -> None:
+        colors, widths = self._curve_styles(self.state.tiling)
+        n = len(colors)
+        if n and len(self._curved_source.data["xs"]) == n:
+            self._curved_source.patch({"line_color": [(slice(None), colors)], "line_width": [(slice(None), widths)]})
+
+    @param.depends("state.live_outline", watch=True)
+    def _show_live_outline(self):
+        """The curve that is being dragged in the curve editor, on every edge of its shape id."""
+        outline = self.state.live_outline
+        if not outline or len(self._curved_source.data["xs"]) != len(self.state.tiling.edge_shape_ids):
+            return
+        self._curved_source.patch({
+            "xs": [(int(i), xs) for i, (xs, _) in outline.items()],
+            "ys": [(int(i), ys) for i, (_, ys) in outline.items()],
+        })
 
     def _mark_invalid_edges(self) -> None:
         """Draw the edges of the shape ids named by ``state.validity`` in red."""
@@ -825,15 +858,17 @@ class PrototileEditor(pn.viewable.Viewer):
         self._mark_invalid_edges()
         self._style_curves()
 
-    def _limits(self) -> list[tuple[float, float]]:
-        return self.state.parameter_limits()
+    def _ranges(self):
+        """The valid interval and the slider window of each parameter (``zoom`` widens the search)."""
+        return self.state.parameter_ranges(self.zoom)
 
     def _on_probe(self, payload: dict) -> None:
         """Parameter changes of a dragged vertex from the browser: check them without committing."""
         try:
             values = list(self.state.parameters)
+            ranges = self._ranges()
             for i, dp in zip(payload["idx"], payload["dp"], strict=True):
-                values[i] = max(0.0, min(1.0, values[i] + dp))
+                values[i] = max(ranges[i].window_lo, min(ranges[i].window_hi, values[i] + dp))
         except (KeyError, IndexError, TypeError, ValueError):
             return
         self.state.probe_parameters(values)
@@ -899,8 +934,9 @@ class PrototileEditor(pn.viewable.Viewer):
         self._in_drag = True
         try:
             new_params = list(self.state.parameters)
+            ranges = self._ranges()
             for pi, dp in param_deltas.items():
-                new_params[pi] = max(0, min(1, new_params[pi] + dp))
+                new_params[pi] = max(ranges[pi].window_lo, min(ranges[pi].window_hi, new_params[pi] + dp))
             # A refused edit redraws the figure from the unchanged draft
             self.state.set_parameters(new_params)
             # Update _orig_positions to the vertex positions of the current draft
@@ -912,12 +948,6 @@ class PrototileEditor(pn.viewable.Viewer):
             }
         finally:
             self._in_drag = False
-
-        # Show thick curves again after drag is complete
-        # (they were hidden by JS during drag)
-        if self.show_curves:
-            for renderer in self._curve_renderers:
-                renderer.visible = True
 
     def _solve_group_params(self, group: dict, displacements: dict) -> dict[int, float]:
         """Solve for parameter deltas given vertex displacements using least squares."""
@@ -977,7 +1007,7 @@ class PrototileEditor(pn.viewable.Viewer):
             align=("center", "start"),
         )
 
-    @param.depends("state.draft", "active_param_group")
+    @param.depends("state.draft", "active_param_group", "zoom")
     def _build_parameter_panel(self):
         info = self.state.type_info
         params = info.get("parameters", [])
@@ -992,26 +1022,35 @@ class PrototileEditor(pn.viewable.Viewer):
         if groups and self.active_param_group < len(groups):
             active_params = set(groups[self.active_param_group]["params"])
 
-        # Build sliders with group-based styling; the track shows the values at which the prototile is invalid
-        limits = self._limits()
-        sliders = []
+        # One row per parameter: slider over its window (the track is red where the prototile is invalid), a field
+        # that takes any valid value, and the valid interval as text
+        ranges = self._ranges()
+        rows = []
         for p in params:
             idx = p["index"]
-            is_in_active_group = idx in active_params
-
-            lo, hi = limits[idx]
+            r = ranges[idx]
+            value = self.state.parameters[idx] if idx < len(self.state.parameters) else p["default"]
             slider = pn.widgets.FloatSlider(
                 name=f"P{idx}: {self._compact_desc(p['description'])}",
-                start=0,
-                end=1,
+                start=r.window_lo,
+                end=r.window_hi,
                 step=0.01,
-                value=self.state.parameters[idx] if idx < len(self.state.parameters) else p["default"],
-                # Visual feedback for active group
-                stylesheets=[self._get_slider_style(is_in_active_group, lo, hi)],
+                value=value,
+                sizing_mode="stretch_width",
+                stylesheets=[self._get_slider_style(idx in active_params, *self._valid_fractions(r))],
             )
-            slider.param.watch(lambda e, i=idx, lim=(lo, hi): self._on_slider_probe(e, i, lim), "value")
-            slider.param.watch(lambda e, i=idx, lim=(lo, hi): self._on_slider_change(e, i, lim), "value_throttled")
-            sliders.append(slider)
+            slider.param.watch(lambda e, i=idx, lim=r: self._on_slider_probe(e, i, lim), "value")
+            slider.param.watch(lambda e, i=idx, lim=r: self._on_slider_change(e, i, lim), "value_throttled")
+            field = pn.widgets.FloatInput(value=value, step=0.01, width=80, margin=(20, 0, 0, 5))
+            field.param.watch(lambda e, i=idx: self._on_field_change(e, i), "value")
+            rows.append(
+                pn.Column(
+                    pn.Row(slider, field, margin=0),
+                    pn.pane.HTML(self._limit_text(r), margin=(0, 0, 0, 10), styles={"font-size": "11px"}),
+                    margin=0,
+                )
+            )
+        sliders = rows
 
         # Group cycle button (only if multiple groups exist)
         group_controls = []
@@ -1024,10 +1063,50 @@ class PrototileEditor(pn.viewable.Viewer):
                 ),
             ]
 
+        zoom_controls = pn.Row(
+            pn.widgets.Button(name="Zoom out x2", on_click=self._zoom_out, disabled=self.zoom >= 4, width=100),
+            pn.widgets.Button(name="Zoom reset", on_click=self._zoom_reset, disabled=self.zoom == 0, width=100),
+            margin=0,
+        )
         return pn.Column(
             *group_controls,
             *sliders,
+            zoom_controls,
         )
+
+    @staticmethod
+    def _valid_fractions(r) -> tuple[float, float]:
+        """The valid interval as fractions of the slider window (for the shaded track)."""
+        span = (r.window_hi - r.window_lo) or 1.0
+        return (r.valid_lo - r.window_lo) / span, (r.valid_hi - r.window_lo) / span
+
+    @staticmethod
+    def _limit_text(r) -> str:
+        """``valid a to b``; ``…`` marks an end that is not a limit within the searched range."""
+        lo = "…" if r.open_lo else f"{r.valid_lo:.3f}"
+        hi = "…" if r.open_hi else f"{r.valid_hi:.3f}"
+        return f"<span style='color:#888'>valid {lo} to {hi}</span>"
+
+    def _zoom_out(self, event) -> None:
+        self.zoom = min(4, self.zoom + 1)
+
+    def _zoom_reset(self, event) -> None:
+        self.zoom = 0
+
+    @param.depends("state.tiling_type", watch=True)
+    def _reset_zoom(self) -> None:
+        self.zoom = 0
+
+    def _on_field_change(self, event, idx: int) -> None:
+        """A value typed in the field is applied if the prototile stays valid there, else refused with the message."""
+        if event.new is None or self.state.parameters[idx] == event.new:
+            return
+        p_desc = self._compact_desc(self.state.type_info["parameters"][idx]["description"])
+        self._in_drag = True
+        try:
+            self.state.set_parameter(idx, event.new, f"Set {p_desc}")
+        finally:
+            self._in_drag = False
 
     def _get_slider_style(self, is_active: bool, lo: float = 0.0, hi: float = 1.0) -> str:
         """Return CSS stylesheet for slider based on active state and the interval ``lo`` to ``hi`` of valid values."""
@@ -1066,10 +1145,10 @@ class PrototileEditor(pn.viewable.Viewer):
         if len(groups) > 1:
             self.active_param_group = (self.active_param_group + 1) % len(groups)
 
-    def _on_slider_probe(self, event, idx: int, limits: tuple[float, float]) -> None:
+    def _on_slider_probe(self, event, idx: int, limits) -> None:
         """A slider moves: it stays inside the valid interval; the value is checked without committing."""
         slider = event.obj
-        clamped = max(limits[0], min(limits[1], event.new))
+        clamped = max(limits.valid_lo, min(limits.valid_hi, event.new))
         if clamped != event.new:
             slider.value = clamped
             return
@@ -1078,8 +1157,8 @@ class PrototileEditor(pn.viewable.Viewer):
             values[idx] = clamped
             self.state.probe_parameters(values)
 
-    def _on_slider_change(self, event, idx: int, limits: tuple[float, float] = (0.0, 1.0)):
-        value = max(limits[0], min(limits[1], event.new))
+    def _on_slider_change(self, event, idx: int, limits=None):
+        value = event.new if limits is None else max(limits.valid_lo, min(limits.valid_hi, event.new))
         if value != event.new:
             event.obj.value = value
         params = self.state.parameters

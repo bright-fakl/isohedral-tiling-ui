@@ -230,11 +230,11 @@ def test_prototile_figure_follows_the_draft(state):
     state.load_preset("puzzle_piece")
     verts = state.tiling.vertices
     assert np.allclose(editor._outline_source.data["xs"][0][:-1], verts[:, 0])
-    assert len(editor._curve_renderers) == len(verts)
+    assert len(editor._curved_source.data["xs"]) == len(verts)
     state.set_parameters([0.3, 0.4])
     assert np.allclose(editor._outline_source.data["xs"][0][:-1], state.tiling.vertices[:, 0])
     state.load_type(10)
-    assert len(editor._curve_renderers) == 6
+    assert len(editor._curved_source.data["xs"]) == 6
 
 
 def drag_vertices(editor: PrototileEditor, state: TilingState, parameter: int, target: float) -> None:
