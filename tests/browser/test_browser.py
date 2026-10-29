@@ -132,10 +132,11 @@ class App:
             self.click_model(self.button(tag))
             try:
                 self.wait_for(read, expected, timeout=4.0)
-                return
             except AssertionError:
                 if attempt == tries - 1:
                     raise
+            else:
+                return
 
     def wait_muted(self, names: set[str]) -> None:
         self.wait_for(self.muted_presets, names)
