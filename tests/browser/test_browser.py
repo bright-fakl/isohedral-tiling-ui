@@ -21,7 +21,6 @@ from isohedral_tiling_ui.utils.curve_presets import list_curve_presets
 sync_api = pytest.importorskip("playwright.sync_api")
 
 APP = Path(__file__).parents[2] / "src" / "isohedral_tiling_ui" / "app.py"
-MUTED = 0.3  # alpha of the movable nodes that are not selected while one is
 
 
 @pytest.fixture(scope="module")
@@ -75,16 +74,15 @@ class App:
     def button(self, tag: str) -> str:
         """Id of the ButtonIcon model with a tag (``preset:<name>``, ``tile:<name>``, ``type:<number>``)."""
         return self.js(
-            "(t) => [...Bokeh.documents[0].all_models].find(m => m.type === 'panel.models.icon.ButtonIcon'"
-            " && m.tags.includes(t)).id",
+            "(t) => [...Bokeh.documents[0].all_models].find(m => m.tags && m.tags.length && m.tags.includes(t)).id",
             tag,
         )
 
     def tagged(self, kind: str) -> dict[str, dict]:
         """Style border and disabled flag of the ButtonIcon models by tag of a kind (``preset``, ``tile``, ``type``)."""
         return self.js(
-            "(k) => Object.fromEntries([...Bokeh.documents[0].all_models].filter(m => m.type === "
-            "'panel.models.icon.ButtonIcon' && m.tags.some(t => t.startsWith(k + ':'))).map(m => "
+            "(k) => Object.fromEntries([...Bokeh.documents[0].all_models].filter(m => m.tags && "
+            "m.tags.some(t => typeof t === 'string' && t.startsWith(k + ':'))).map(m => "
             "[m.tags[0].slice(k.length + 1), {disabled: m.disabled, styles: m.styles || {}}]))",
             kind,
         )
@@ -136,7 +134,7 @@ class App:
     # -- the curve editor ------------------------------------------------------------------------------
 
     def curve_nodes(self) -> dict:
-        """Index, fill color, alpha and position (screen) of the movable nodes of the curve editor."""
+        """Index, fill color and position (screen) of the movable nodes of the curve editor."""
         return self.js(
             """() => {
             const cp = [...Bokeh.documents[0].all_models].find(
@@ -146,7 +144,7 @@ class App:
             const v = Bokeh.index.find_one(fig), r = v.canvas_view.el.getBoundingClientRect();
             const d = cp.data;
             return {idx: Array.from(d.idx), fill: Array.from(d.fill_color), line: Array.from(d.line_color),
-                alpha: Array.from(d.alpha), x: Array.from(d.x), y: Array.from(d.y),
+                x: Array.from(d.x), y: Array.from(d.y),
                 px: Array.from(d.x).map(x => r.x + v.frame.x_scale.compute(x)),
                 py: Array.from(d.y).map(y => r.y + v.frame.y_scale.compute(y))};
             }"""
@@ -186,6 +184,25 @@ class App:
         self.page.mouse.move(x + dx / 2, y + dy / 2, steps=5)
         self.page.mouse.move(x + dx, y + dy, steps=5)
         self.page.mouse.up()
+        time.sleep(0.8)
+
+    def curve_editor_state(self) -> dict:
+        """Number of movable nodes, fixed nodes and curve points of the curve editor, and whether it is shown."""
+        return self.js(
+            """() => {
+            const by = n => [...Bokeh.documents[0].all_models].find(m => m.name === n);
+            const nodes = by('movable_nodes'), fig = [...Bokeh.documents[0].all_models].find(
+                m => m.type === 'Figure' && m.renderers.some(r => r.data_source === nodes));
+            const view = Bokeh.index.find_one(fig);
+            return {nodes: nodes.data.x.length, fixed: by('fixed_nodes').data.x.length,
+                curve: by('curve').data.x.length, shown: !!(view && view.el.offsetParent !== null)};
+            }"""
+        )
+
+    def select_curve(self, label: str) -> None:
+        self.page.locator("select", has=self.page.locator(f"option:text-is('{label}')")).first.select_option(
+            label=label
+        )
         time.sleep(0.8)
 
     def tap_empty(self) -> None:
@@ -230,39 +247,62 @@ def test_presets_stay_available_after_clicks(app):
 def test_nodes_have_one_color_and_the_selection_survives_a_drag(app):
     app.click_preset("scalloped")
     nodes = app.curve_nodes()
-    assert len(set(nodes["fill"])) == 1 and set(nodes["alpha"]) == {1}  # no node is special
+    assert set(nodes["fill"]) == {"#444"}  # no node is special
     n = app.undo_count()
     app.drag_node(1, 0, -40)  # drag the middle node up, release
     after = app.curve_nodes()
     assert after["y"][1] > nodes["y"][1] + 0.2
     assert app.undo_count() == n + 1
-    # the dragged node stays selected, the others are muted
+    # the dragged node stays selected; the others keep the color of the unselected state
     assert after["fill"] == ["#444", "crimson", "#444"]
-    assert after["alpha"] == [MUTED, 1, MUTED]
     # a drag of another node moves the selection
     app.drag_node(0, 0, 20)
-    after = app.curve_nodes()
-    assert after["fill"] == ["crimson", "#444", "#444"]
-    assert after["alpha"] == [1, MUTED, MUTED]
+    assert app.curve_nodes()["fill"] == ["crimson", "#444", "#444"]
     # a click on empty space deselects
     app.tap_empty()
-    after = app.curve_nodes()
-    assert set(after["fill"]) == {"#444"} and set(after["alpha"]) == {1}
+    assert set(app.curve_nodes()["fill"]) == {"#444"}
     # a click on a node selects it
     nodes = app.curve_nodes()
     app.page.mouse.click(nodes["px"][2], nodes["py"][2])
     time.sleep(0.5)
-    assert app.curve_nodes()["alpha"] == [MUTED, MUTED, 1]
+    assert app.curve_nodes()["fill"] == ["#444", "#444", "crimson"]
+
+
+def test_nodes_are_selected_with_shift_and_moved_together(app):
+    app.click_preset("scalloped")
+    nodes = app.curve_nodes()
+    app.page.mouse.click(nodes["px"][0], nodes["py"][0])
+    time.sleep(0.6)  # two clicks within 300 ms are a double click
+    app.page.keyboard.down("Shift")
+    app.page.mouse.click(nodes["px"][2], nodes["py"][2])
+    app.page.keyboard.up("Shift")
+    time.sleep(0.5)
+    assert app.curve_nodes()["fill"] == ["crimson", "#444", "crimson"]
+    n = app.undo_count()
+    app.drag_node(0, 0, -30)  # dragging one selected node moves both
+    after = app.curve_nodes()
+    assert after["fill"] == ["crimson", "#444", "crimson"]  # the selection survives the drag
+    shift = [a - b for a, b in zip(after["y"], nodes["y"], strict=True)]
+    assert shift[0] > 0.2 and shift[2] == pytest.approx(shift[0], abs=1e-6) and shift[1] == pytest.approx(0, abs=1e-9)
+    app.wait_for(app.undo_count, n + 1)
+    app.drag_node(2, 0, 20)  # and again, from the kept selection
+    again = app.curve_nodes()
+    moved = [a - b for a, b in zip(again["y"], after["y"], strict=True)]
+    assert moved[0] < -0.1 and moved[2] == pytest.approx(moved[0], abs=1e-6) and moved[1] == pytest.approx(0, abs=1e-9)
+    # a plain click on one node selects only that node
+    app.page.mouse.click(again["px"][1], again["py"][1])
+    time.sleep(0.5)
+    assert app.curve_nodes()["fill"] == ["#444", "crimson", "#444"]
 
 
 def test_the_selection_survives_a_redraw_of_the_curve(app):
     app.click_preset("scalloped")
     app.drag_node(1, 0, -20)
-    assert app.curve_nodes()["alpha"] == [MUTED, 1, MUTED]
+    assert app.curve_nodes()["fill"] == ["#444", "crimson", "#444"]
     app.click_text("Undo")  # the curve is drawn again from the draft: the node still exists and stays selected
-    app.wait_for(lambda: app.curve_nodes()["alpha"], [MUTED, 1, MUTED])
+    app.wait_for(lambda: app.curve_nodes()["fill"], ["#444", "crimson", "#444"])
     app.click_text("Redo")
-    app.wait_for(lambda: app.curve_nodes()["alpha"], [MUTED, 1, MUTED])
+    app.wait_for(lambda: app.curve_nodes()["fill"], ["#444", "crimson", "#444"])
     app.click_text("Undo")
     app.click_text("Undo")  # back to the straight curve: no movable nodes
     app.wait_for(lambda: app.undo_count(), 0)
@@ -311,3 +351,71 @@ def test_the_gallery_tile_of_the_design_is_the_marked_one(app):
     app.click_model(app.button("tile:square"))
     app.wait_for(lambda: app.marked("tile"), ["square"])
     assert app.marked("type") == []
+
+
+def test_tiles_and_types_stay_selectable_after_being_selected(app):
+    app.click_text("Tiling Type")
+    for tag, kind in [
+        ("tile:tree", "tile"),
+        ("tile:square", "tile"),
+        ("tile:tree", "tile"),
+        ("type:41", "type"),
+        ("type:4", "type"),
+        ("type:41", "type"),
+        ("tile:square", "tile"),
+        ("tile:square", "tile"),
+        ("tile:tree", "tile"),
+        ("type:4", "type"),
+    ]:
+        app.click_model(app.button(tag))
+        app.wait_for(lambda k=kind: app.marked(k), [tag.split(":")[1]])
+        other = "type" if kind == "tile" else "tile"
+        assert app.marked(other) == []
+        buttons = app.tagged(kind)
+        assert not any(b["disabled"] for b in buttons.values())
+    # after an edit the same tile loads again (a new baseline)
+    app.click_model(app.button("tile:tree"))
+    app.wait_for(app.undo_count, 0)
+    available = [n for n in list_curve_presets() if n not in app.muted_presets()]
+    app.click_preset(available[0])  # an edit of the tree
+    app.wait_for(app.undo_count, 1)
+    app.click_model(app.button("tile:tree"))
+    app.wait_for(app.undo_count, 0)
+
+
+def test_a_tile_without_editable_curves_clears_the_curve_editor(app):
+    app.click_preset("scalloped")
+    assert len(app.curve_nodes()["x"]) == 3
+    app.click_model(app.button("tile:equilateral_triangle"))  # type 93: no editable edge
+    app.wait_for(lambda: app.marked("tile"), ["equilateral_triangle"])
+    state = app.curve_editor_state()
+    assert state == {"nodes": 0, "fixed": 0, "curve": 0, "shown": False}
+    app.wait_for(app.muted_presets, set(list_curve_presets()))
+    n = app.undo_count()
+    app.click_preset("scalloped")  # no effect
+    assert app.undo_count() == n
+    # a tile with curves again, then a type without curves, undo and reset
+    app.click_model(app.button("tile:wavy_triangle"))
+    app.wait_for(lambda: app.curve_editor_state()["shown"], True)
+    assert app.curve_editor_state()["curve"] > 2
+    app.click_text("Tiling Type")
+    app.click_model(app.button("type:93"))
+    app.wait_for(lambda: app.curve_editor_state(), {"nodes": 0, "fixed": 0, "curve": 0, "shown": False})
+
+
+def test_preset_availability_follows_the_selected_edge(app):
+    app.click_text("Tiling Type")
+    app.click_model(app.button("type:41"))  # two free edges C0 and C1
+    app.wait_for(lambda: app.marked("type"), ["41"])
+    app.click_preset("scalloped")  # C0
+    app.wait_for(app.undo_count, 1)
+    assert "scalloped" in app.muted_presets() and "straight" not in app.muted_presets()
+    app.select_curve("C1 (J)")
+    app.wait_for(lambda: "scalloped" in app.muted_presets(), False)
+    assert "straight" in app.muted_presets()  # C1 is still straight
+    app.click_preset("scalloped_down")
+    app.wait_for(lambda: "scalloped_down" in app.muted_presets(), True)
+    assert "straight" not in app.muted_presets()
+    app.select_curve("C0 (J)")
+    app.wait_for(lambda: "scalloped" in app.muted_presets(), True)
+    assert "scalloped_down" not in app.muted_presets() and "straight" not in app.muted_presets()

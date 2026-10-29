@@ -8,6 +8,8 @@ import panel as pn
 import param
 from isotile import find_types, get_type, list_presets
 
+from isohedral_tiling_ui.components.icon_button import icon_button
+
 NORMAL = {"border": "1px solid #eee", "background": "transparent"}
 SELECTED = {"border": "2px solid #1971c2", "background": "#e7f1fb"}
 
@@ -24,7 +26,7 @@ class TileTypeSelector(pn.viewable.Viewer):
     def __init__(self, **params):
         super().__init__(**params)
         self._grid = pn.GridBox(ncols=6, nrows=0)
-        self._buttons: dict[int, pn.widgets.ButtonIcon] = {}
+        self._buttons: dict[int, pn.widgets.Button] = {}
         self._build_grid()
         self.state.param.watch(self._mark_selected, ["tiling_type", "source_label"])
 
@@ -88,14 +90,14 @@ class TileTypeSelector(pn.viewable.Viewer):
         tooltip_text = f"IH{tiling_type}: {num_vertices} vertices, {num_params} params, {num_aspects} aspects, {len(customizable)} editable edges"
 
         # Create a button with the SVG as its content - smaller and tighter
-        btn = pn.widgets.ButtonIcon(
-            icon=svg,
-            active_icon=svg,  # the default active icon is a check mark that stays after a click
+        btn = icon_button(
+            svg,
+            28,
+            lambda e, t=tiling_type: self._on_type_select(t),
             width=30,
             height=30,
-            margin=0,  # (1, 1, 1, 1),  # Tight spacing
+            margin=0,
             description=tooltip_text,  # Tooltip on hover
-            on_click=lambda e, t=tiling_type: self._on_type_select(t),
             styles=NORMAL,
             align="center",
             tags=[f"type:{tiling_type}"],

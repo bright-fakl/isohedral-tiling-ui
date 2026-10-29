@@ -11,13 +11,13 @@ from bokeh.models import ColumnDataSource, CustomJS
 from bokeh.plotting import figure
 from isotile import interpolate
 
+from isohedral_tiling_ui.components.icon_button import icon_button
 from isohedral_tiling_ui.editor_model import editable, preset_availability
 from isohedral_tiling_ui.utils.curve_presets import get_curve_preset, list_curve_presets
 
 SELECTED_FILL, SELECTED_LINE = "crimson", "#7a0000"
 NODE_FILL, NODE_LINE = "#444", "#111"
 FIXED_FILL, FIXED_LINE = "#ccc", "#999"
-MUTED_ALPHA = 0.3  # alpha of the movable nodes while one of them is selected
 
 
 class CurveEditor(pn.viewable.Viewer):
@@ -35,27 +35,33 @@ class CurveEditor(pn.viewable.Viewer):
                 "editable": [],
                 "fill_color": [],
                 "line_color": [],
-                "alpha": [],
                 "edge_shape": [],
-            }
+            },
+            name="movable_nodes",
         )
-        # Index (in the curve) of the selected movable node, -1 if none. Kept apart from the selection of the source,
-        # which PointDrawTool clears at the end of every drag.
-        self._selection_source = ColumnDataSource(data={"idx": [-1]})
+        # Indices (in the curve) of the selected movable nodes. Kept apart from the selection of the source, which
+        # PointDrawTool clears at the end of every drag.
+        self._selection_source = ColumnDataSource(data={"idx": []})
         self._selection_curve_id: int | None = None
         # Separate source for fixed (non-editable) points - not connected to PointDrawTool
-        self._fixed_cp_source = ColumnDataSource(data={"x": [], "y": [], "idx": [], "fill_color": [], "line_color": []})
-        self._curve_source = ColumnDataSource(data={"x": [], "y": []})
+        self._fixed_cp_source = ColumnDataSource(
+            data={"x": [], "y": [], "idx": [], "fill_color": [], "line_color": []}, name="fixed_nodes"
+        )
+        self._curve_source = ColumnDataSource(data={"x": [], "y": []}, name="curve")
         self._baseline_source = ColumnDataSource(data={"x": [0, 1], "y": [0, 0]})
         self._updating_from_state = False  # Flag to prevent circular updates
         self._programmatic_cp_update = False  # Flag to skip history push on programmatic cp_source writes
         self._y_scale = 1.0  # Y-axis scale factor (default ±1)
-        self._preset_buttons: dict[str, pn.widgets.ButtonIcon] = {}
-        # name -> reason a preset is unavailable ("" if available). Not the ``disabled`` property: the browser model of
-        # a ButtonIcon sets it to true on click and to false 75 ms later, which overwrites the value set here.
+        self._preset_buttons: dict[str, pn.widgets.Button] = {}
+        # name -> reason a preset is unavailable ("" if available); the button is muted and a click is ignored
         self._preset_reasons: dict[str, str] = {}
         self._preset_grid = self._build_preset_buttons()
         self._figure = self._build_figure()
+        self._plot_row = pn.Row(
+            pn.pane.Bokeh(self._figure, height=210, sizing_mode="stretch_width"),
+            self._preset_grid,
+            sizing_mode="stretch_width",
+        )
         self._setup_callbacks()
         # Initialize with current state values since @param.depends doesn't fire on init
         self._update_figure()
@@ -128,8 +134,6 @@ class CurveEditor(pn.viewable.Viewer):
             size=10,
             fill_color="fill_color",
             line_color="line_color",
-            fill_alpha="alpha",
-            line_alpha="alpha",
         )
         # the node colors come from the columns, not from the selection of the source
         self._cp_renderer.selection_glyph = None
@@ -287,51 +291,77 @@ class CurveEditor(pn.viewable.Viewer):
         return p
 
     def _add_selection_callbacks(self, p) -> None:
-        """Select a node by clicking or dragging it, deselect by clicking elsewhere; the selection survives drags.
+        """Select nodes by clicking or dragging (shift-click adds to the selection); the selection survives drags.
 
-        The selected node is highlighted and the other movable nodes are muted. PointDrawTool selects the node under
-        the pointer and clears that selection when a drag ends, so the choice is copied to ``_selection_source``.
+        The selected nodes are crimson, the other movable nodes dark gray. PointDrawTool selects the node under the
+        pointer, adds with shift, moves all selected nodes together when one of them is dragged, and clears the
+        selection when a drag ends. The selection is copied to ``_selection_source`` and put back after a drag.
         """
         args = {
             "cp_source": self._cp_source,
             "sel_source": self._selection_source,
-            "style": {
-                "fill": SELECTED_FILL,
-                "line": SELECTED_LINE,
-                "node_fill": NODE_FILL,
-                "node_line": NODE_LINE,
-                "muted": MUTED_ALPHA,
-            },
+            "style": {"fill": SELECTED_FILL, "line": SELECTED_LINE, "node_fill": NODE_FILL, "node_line": NODE_LINE},
         }
         recolor = """
-        const cur = sel_source.data.idx[0];
-        const d = cp_source.data;
-        for (let i = 0; i < d.idx.length; i++) {
-            const on = d.idx[i] === cur;
-            d.fill_color[i] = on ? style.fill : style.node_fill;
-            d.line_color[i] = on ? style.line : style.node_line;
-            d.alpha[i] = (cur < 0 || on) ? 1 : style.muted;
+        const picked = sel_source.data.idx;
+        const pd = cp_source.data;
+        for (let i = 0; i < pd.idx.length; i++) {
+            const on = picked.includes(pd.idx[i]);
+            pd.fill_color[i] = on ? style.fill : style.node_fill;
+            pd.line_color[i] = on ? style.line : style.node_line;
         }
         cp_source.change.emit();
         """
         on_indices = CustomJS(
             args=args,
             code="""
-            if (cp_source._panning && cp_source.selected.indices.length === 0) return;  // the end of a drag
             const k = cp_source.selected.indices;
-            const sel = k.length ? cp_source.data.idx[k[0]] : -1;
-            if (sel_source.data.idx[0] === sel) return;
-            sel_source.data = {idx: [sel]};
+            if (cp_source._panning && k.length === 0) return;  // the end of a drag
+            const chosen = Array.from(k, i => cp_source.data.idx[i]).sort((a, b) => a - b);
+            const old = sel_source.data.idx;
+            if (old.length === chosen.length && old.every((v, i) => v === chosen[i])) return;
+            cp_source._before = {idx: Array.from(old), time: performance.now()};  // for the start of a drag
+            sel_source.data = {idx: chosen};
             """
             + recolor,
         )
         self._cp_source.selected.js_on_change("indices", on_indices)
-        p.js_on_event("panstart", CustomJS(args={"cp_source": self._cp_source}, code="cp_source._panning = true;"))
+        # a drag that starts on a node outside the selection (without shift) selects that node only
+        p.js_on_event(
+            "panstart",
+            CustomJS(
+                args={"cp_source": self._cp_source, "sel_source": self._selection_source, "fig": p},
+                code="""
+                cp_source._panning = true;
+                if (cb_obj.modifiers && cb_obj.modifiers.shift) return;
+                const v = Bokeh.index.find_one(fig), d = cp_source.data;
+                // the selection before the tool selected the node under the pointer
+                const b = cp_source._before;
+                const before = b && performance.now() - b.time < 100 ? b.idx : Array.from(sel_source.data.idx);
+                let hit = -1, best = 12;
+                for (let i = 0; i < d.x.length; i++) {
+                    const dist = Math.hypot(v.frame.x_scale.compute(d.x[i]) - cb_obj.sx,
+                                            v.frame.y_scale.compute(d.y[i]) - cb_obj.sy);
+                    if (dist < best) { best = dist; hit = i; }
+                }
+                if (hit >= 0 && !before.includes(d.idx[hit])) cp_source.selected.indices = [hit];
+                """,
+            ),
+        )
+        # after a drag the tool has cleared its selection: select the nodes again, so the next drag moves them all
         p.js_on_event(
             "panend",
             CustomJS(
-                args={"cp_source": self._cp_source},
-                code="setTimeout(() => { cp_source._panning = false; }, 0);",
+                args={"cp_source": self._cp_source, "sel_source": self._selection_source},
+                code="""
+                setTimeout(() => {
+                    cp_source._panning = false;
+                    const chosen = sel_source.data.idx, d = cp_source.data;
+                    const k = [];
+                    for (let i = 0; i < d.idx.length; i++) if (chosen.includes(d.idx[i])) k.push(i);
+                    if (k.length) cp_source.selected.indices = k;
+                }, 0);
+                """,
             ),
         )
         # a click on empty space leaves the source without selection, a click on a node leaves it selected
@@ -341,8 +371,8 @@ class CurveEditor(pn.viewable.Viewer):
                 args=args,
                 code="""
                 setTimeout(() => {
-                    if (cp_source.selected.indices.length === 0 && sel_source.data.idx[0] !== -1) {
-                        sel_source.data = {idx: [-1]};
+                    if (cp_source.selected.indices.length === 0 && sel_source.data.idx.length) {
+                        sel_source.data = {idx: []};
                         """
                 + recolor
                 + """
@@ -365,24 +395,28 @@ class CurveEditor(pn.viewable.Viewer):
             return
 
         curve_id = self.state.active_curve_id
-        if curve_id is None:
+        self._plot_row.visible = curve_id is not None
+        if curve_id is None:  # the type has no curve to edit: show nothing of the previous one
+            self._show_no_curve()
             return
 
         curve = self.state.draft.curve(curve_id)
         n = len(curve)
         edge_shape = self.state.shape_type(curve_id)
 
-        # Keep the selection while the curve keeps the node
-        selected = self._selection_source.data["idx"][0]
-        if curve_id != self._selection_curve_id or selected >= n or not editable(edge_shape, n, selected):
-            selected = -1
+        # Keep the selected nodes while the curve keeps them
+        kept = [
+            i
+            for i in self._selection_source.data["idx"]
+            if curve_id == self._selection_curve_id and i < n and editable(edge_shape, n, i)
+        ]
         self._selection_curve_id = curve_id
-        if self._selection_source.data["idx"][0] != selected:
-            self._selection_source.data = {"idx": [selected]}
+        if kept != list(self._selection_source.data["idx"]):
+            self._selection_source.data = {"idx": kept}
 
         # Separate editable and fixed points
         editable_x, editable_y, editable_idx = [], [], []
-        editable_fill_color, editable_line_color, editable_alpha = [], [], []
+        editable_fill_color, editable_line_color = [], []
         fixed_x, fixed_y, fixed_idx = [], [], []
 
         for i in range(n):
@@ -390,10 +424,8 @@ class CurveEditor(pn.viewable.Viewer):
                 editable_x.append(curve[i][0])
                 editable_y.append(curve[i][1])
                 editable_idx.append(i)
-                is_selected = i == selected
-                editable_fill_color.append(SELECTED_FILL if is_selected else NODE_FILL)
-                editable_line_color.append(SELECTED_LINE if is_selected else NODE_LINE)
-                editable_alpha.append(1.0 if is_selected or selected < 0 else MUTED_ALPHA)
+                editable_fill_color.append(SELECTED_FILL if i in kept else NODE_FILL)
+                editable_line_color.append(SELECTED_LINE if i in kept else NODE_LINE)
             else:
                 fixed_x.append(curve[i][0])
                 fixed_y.append(curve[i][1])
@@ -411,7 +443,6 @@ class CurveEditor(pn.viewable.Viewer):
                 "editable": [True] * len(editable_x),
                 "fill_color": editable_fill_color,
                 "line_color": editable_line_color,
-                "alpha": editable_alpha,
                 "edge_shape": [edge_shape] * len(editable_x),
             }
             self._fixed_cp_source.data = {
@@ -423,8 +454,21 @@ class CurveEditor(pn.viewable.Viewer):
             }
         finally:
             self._programmatic_cp_update = False
+        self._cp_source.selected.indices = [k for k, i in enumerate(editable_idx) if i in kept]
 
         self._show_curve(curve_id, curve)
+
+    def _show_no_curve(self) -> None:
+        """Empty the figure: no curve, no nodes, no selection."""
+        self._selection_curve_id = None
+        self._selection_source.data = {"idx": []}
+        self._programmatic_cp_update = True
+        try:
+            self._cp_source.data = {k: [] for k in self._cp_source.data}
+            self._fixed_cp_source.data = {k: [] for k in self._fixed_cp_source.data}
+        finally:
+            self._programmatic_cp_update = False
+        self._curve_source.data = {"x": [], "y": []}
 
     def _show_curve(self, curve_id: int, curve) -> None:
         """Draw the curve of a shape id in its mode (linear through the control points, or spline)."""
@@ -589,11 +633,7 @@ class CurveEditor(pn.viewable.Viewer):
         return pn.Column(
             pn.pane.Markdown("### Edge Curves"),
             self._build_curve_selector_row,
-            pn.Row(
-                pn.pane.Bokeh(self._figure, height=210, sizing_mode="stretch_width"),
-                self._preset_grid,
-                sizing_mode="stretch_width",
-            ),
+            self._plot_row,
             self._build_point_inputs,  # Pass as callable for reactivity
             sizing_mode="stretch_width",
             margin=5,
@@ -775,12 +815,14 @@ class CurveEditor(pn.viewable.Viewer):
             # Get description for tooltip
             desc = preset_descriptions.get(name, name.replace("_", " ").title())
 
-            btn = pn.widgets.ButtonIcon(
-                icon=svg,
-                active_icon=svg,  # the default active icon is a check mark that stays after a click
+            btn = icon_button(
+                svg,
+                24,
+                lambda e, n=name: self._apply_preset(n),
+                width=30,
+                height=28,
+                margin=1,
                 description=desc,
-                on_click=lambda e, n=name: self._apply_preset(n),
-                size="24px",
                 tags=[f"preset:{name}"],
             )
             self._preset_buttons[name] = btn
@@ -794,9 +836,12 @@ class CurveEditor(pn.viewable.Viewer):
     def _refresh_presets(self):
         """Mute the presets that cannot be applied to the selected curve and say why in the tooltip."""
         curve_id = self.state.active_curve_id
-        if not self._preset_buttons or curve_id is None:
+        if not self._preset_buttons:
             return
-        status = preset_availability(self.state.draft, curve_id)
+        if curve_id is None:
+            status = dict.fromkeys(self._preset_buttons, "the tile has no editable curve")
+        else:
+            status = preset_availability(self.state.draft, curve_id)
         for name, button in self._preset_buttons.items():
             reason = status[name]
             description = self._preset_descriptions[name]

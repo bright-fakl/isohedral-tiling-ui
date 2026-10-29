@@ -367,12 +367,15 @@ def test_preset_buttons_are_unavailable_with_a_reason_where_the_preset_cannot_ap
     assert buttons["scalloped"].styles == {}
 
 
-def test_buttons_are_never_disabled_through_the_disabled_property(state):
-    """The browser model of a ButtonIcon sets ``disabled`` itself on every click and resets it 75 ms later."""
-    editor = CurveEditor(state=state)
+def test_icon_buttons_are_not_button_icons(state):
+    """A ButtonIcon changes its own disabled and value in the browser and can stay stuck; plain buttons do not."""
+    selector, gallery, curves = TileTypeSelector(state=state), GalleryPanel(state=state), CurveEditor(state=state)
+    buttons = [*selector._buttons.values(), *gallery._buttons.values(), *curves._preset_buttons.values()]
+    assert len(buttons) > 100
+    assert all(type(b).__name__ == "Button" and not b.disabled for b in buttons)
     state.load_type(36)
-    click(editor._preset_buttons["scalloped"])
-    assert not any(b.disabled for b in editor._preset_buttons.values())
+    click(curves._preset_buttons["scalloped"])
+    assert not any(b.disabled for b in buttons)
 
 
 def test_preset_availability_follows_the_draft_after_every_change(state):
@@ -430,19 +433,40 @@ def test_node_colors_are_uniform_and_the_selection_is_kept_by_the_editor(state):
     editor = CurveEditor(state=state)
     state.load_preset("puzzle_piece")
     data = editor._cp_source.data
-    assert set(data["fill_color"]) == {"#444"} and set(data["alpha"]) == {1.0}  # no node is special
+    assert set(data["fill_color"]) == {"#444"}  # no node is special
     assert set(editor._fixed_cp_source.data["fill_color"]) == {"#ccc"}
-    node = data["idx"][1]
-    editor._selection_source.data = {"idx": [node]}  # what the browser sets when a node is selected
-    editor._update_figure()  # a redraw keeps the selection of a node that still exists
+    nodes = [data["idx"][1], data["idx"][3]]
+    editor._selection_source.data = {"idx": nodes}  # what the browser sets when nodes are selected
+    editor._update_figure()  # a redraw keeps the selected nodes of the same curve
     data = editor._cp_source.data
-    assert [(i, c, a) for i, c, a in zip(data["idx"], data["fill_color"], data["alpha"], strict=True)] == [
-        (i, "crimson" if i == node else "#444", 1.0 if i == node else 0.3) for i in data["idx"]
-    ]
+    assert [c for i, c in zip(data["idx"], data["fill_color"], strict=True) if i in nodes] == ["crimson"] * 2
+    assert [c for i, c in zip(data["idx"], data["fill_color"], strict=True) if i not in nodes] == ["#444"] * (
+        len(data["idx"]) - 2
+    )
+    assert editor._cp_source.selected.indices == [1, 3]
     other = next(c for c in state.type_info["customizable_shape_ids"] if c != state.active_curve_id)
     state.active_curve_id = other  # another curve: no selection
-    assert editor._selection_source.data["idx"] == [-1]
-    assert set(editor._cp_source.data["alpha"]) == {1.0}
+    assert list(editor._selection_source.data["idx"]) == []
+    assert set(editor._cp_source.data["fill_color"]) <= {"#444"}
+
+
+def test_the_curve_editor_shows_nothing_for_a_tile_without_editable_curves(state):
+    editor = CurveEditor(state=state)
+    state.load_preset("wavy_triangle")
+    click(editor._preset_buttons["scalloped"])
+    assert len(editor._cp_source.data["x"]) > 0 and editor._plot_row.visible
+    state.load_preset("equilateral_triangle")  # type 93 has no editable edge
+    assert state.active_curve_id is None
+    assert editor._cp_source.data["x"] == [] and editor._fixed_cp_source.data["x"] == []
+    assert editor._curve_source.data["x"] == []
+    assert not editor._plot_row.visible
+    assert unavailable(editor) == set(editor._preset_buttons)
+    n = len(state.model.labels)
+    click(editor._preset_buttons["scalloped"])  # no effect
+    assert len(state.model.labels) == n
+    state.load_preset("wavy_triangle")  # a tile with curves again
+    assert editor._plot_row.visible and len(editor._cp_source.data["x"]) > 0
+    assert unavailable(editor) != set(editor._preset_buttons)
 
 
 def test_table_edit_is_applied_through_a_scheduled_callback(state, monkeypatch):
@@ -517,14 +541,6 @@ def test_gallery_marks_the_loaded_preset_and_the_type_panel_the_type_otherwise(s
     state.load_type(93)
     assert marked() == ([], [93])
     assert all(b.styles["background"] == "transparent" for n, b in selector._buttons.items() if n != 93)
-
-
-def test_buttons_show_no_check_mark_after_a_click(state):
-    """The default active icon of a ButtonIcon is a check mark that stays; the buttons use their own icon."""
-    selector, gallery, curves = TileTypeSelector(state=state), GalleryPanel(state=state), CurveEditor(state=state)
-    buttons = [*selector._buttons.values(), *gallery._grid.objects, *curves._preset_buttons.values()]
-    assert len(buttons) > 100
-    assert all(b.active_icon == b.icon for b in buttons)
 
 
 def test_history_toolbar_follows_the_model(state):
