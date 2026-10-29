@@ -101,7 +101,11 @@ class App:
         time.sleep(0.4)
 
     def click_preset(self, name: str) -> None:
+        """Click a preset; if it was available, wait until it is applied (it is then the current curve: muted)."""
+        was_muted = name in self.muted_presets()
         self.click_model(self.button(f"preset:{name}"))
+        if not was_muted:
+            self.wait_for(lambda: name in self.muted_presets(), True)
 
     def muted_presets(self) -> set[str]:
         """Names of the preset buttons shown as unavailable."""
