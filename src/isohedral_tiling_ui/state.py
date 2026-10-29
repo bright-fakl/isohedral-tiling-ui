@@ -1,431 +1,249 @@
-"""Reactive state container for the tiling application."""
+"""Reactive adapter between the editor model and the Panel components.
 
-from contextlib import contextmanager
-from datetime import datetime, timedelta
+The design lives in an immutable ``Draft`` held by an ``EditorModel``. ``TilingState`` publishes it as the single
+parameter ``draft``; the components redraw when it changes. An edit that would give an invalid prototile is refused with
+a notification and the previous draft stays.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Callable
+from typing import Any
 
 import panel as pn
 import param
+from isotile import IsohedralTiling, enforce_symmetry
 
-from carto_flow.symbol_cartogram.tiling import IsohedralTiling
+from isohedral_tiling_ui.editor_model import (
+    DEFAULT_PRESET,
+    Draft,
+    EditorModel,
+    add_node,
+    move_node,
+    remove_node,
+    shape_of,
+    type_info,
+)
+from isohedral_tiling_ui.exports import Appearance
+from isohedral_tiling_ui.utils.icons import prototile_svg
+
+logger = logging.getLogger(__name__)
+
+Notify = Callable[[str, str], None]
 
 
-class TilingState(param.Parameterized):
-    """Reactive state container for the tiling application."""
+def panel_notify(level: str, message: str) -> None:
+    """Show a Panel notification (level: success, info, warning or error); log it outside a server session."""
+    notifications = pn.state.notifications
+    if notifications is None:
+        logger.log(logging.ERROR if level == "error" else logging.INFO, "%s: %s", level, message)
+    else:
+        getattr(notifications, level)(message)
 
-    _batching = param.Boolean(default=False, precedence=-1)
-    _pending_update = param.Boolean(default=False, precedence=-1)
 
-    @contextmanager
-    def batch_update(self):
-        """Context manager to batch multiple parameter changes.
+class ViewSettings(param.Parameterized):
+    """Settings of the preview and the exports. They are not part of the design and not in the history."""
 
-        Suspend automatic tiling updates during batch operations and
-        trigger a single update when the batch completes.
-        """
-        was_batching = self._batching
-        self._batching = True
-        try:
-            yield
-        finally:
-            self._batching = was_batching
-            if not was_batching:
-                # Trigger single update after batch completes
-                self._update_tiling()
-
-    def _schedule_async_update(self):
-        """Schedule an async update with debouncing.
-
-        Multiple rapid calls are squashed into a single update.
-        Uses Panel's scheduling to work in both sync and async contexts.
-        """
-        if self._pending_update:
-            return  # Already have an update scheduled
-
-        self._pending_update = True
-
-        def _do_update():
-            self._pending_update = False
-            self._do_async_update()
-
-        # Schedule update 50ms from now - debounces rapid changes
-        at_time = datetime.now() + timedelta(milliseconds=50)
-        pn.state.schedule_task("tiling_update", _do_update, at=at_time)
-
-    tiling_type = param.Integer(default=10, doc="Current tiling type (IH number)")
-    parameters = param.List(default=[], doc="Current parameter values")
-    parameters_version = param.Integer(default=0, doc="Incremented on reset/load")
-    current_preset = param.String(default="regular_hexagon", doc="Current preset name if loaded from gallery")
-    _reset_ranges = param.Boolean(default=False, precedence=-1, doc="Internal flag to indicate ranges should be reset")
-    edge_curves = param.Dict(default={}, doc="Shape ID -> control points")
-    edge_curve_modes = param.Dict(default={}, doc="Shape ID -> linear/spline")
-    active_curve_id = param.Integer(default=None, allow_None=True)
-    active_param_idx = param.Integer(default=0)
-
-    # Grid size: small=50, medium=100, large=200 tiles
     grid_size = param.Selector(default="Medium", objects=["Small", "Medium", "Large"], doc="Grid size")
-
-    # Color settings
-    face_color_mode = param.Selector(default="aspect", objects=["uniform", "aspect", "index"], doc="Face color mode")
-    face_color = param.Color(default="#1f77b4")  # , doc="Uniform face color")
+    face_color_mode = param.Selector(default="aspect", objects=["uniform", "aspect", "coloring"], doc="Face color mode")
+    face_color = param.Color(default="#1f77b4")
     face_colormap = param.Selector(
         default="Category10", objects=["Category10", "Viridis", "Plasma", "Inferno", "Turbo"]
     )
-    edge_color = param.Color(default="#333333")  # , doc="Edge color")
+    edge_color = param.Color(default="#333333")
 
-    # Computed properties
-    _tiling = param.ClassSelector(class_=IsohedralTiling, precedence=-1)
-    _type_info = param.Dict(precedence=-1)
+    def appearance(self) -> Appearance:
+        return Appearance(self.face_color_mode, self.face_color, self.face_colormap, self.edge_color)
 
-    # Initial state for reset
-    _initial_parameters = param.List(default=[], precedence=-1, doc="Parameters at selection/load time")
-    _initial_edge_curves = param.Dict(default={}, precedence=-1, doc="Edge curves at selection/load time")
-    _initial_preset_name = param.String(default="", precedence=-1, doc="Initial preset name for display")
-    _initial_prototile_svg = param.String(default="", precedence=-1, doc="SVG of initial prototile")
 
-    # History for undo/redo
-    _history = param.List(default=[], precedence=-1)
-    _history_idx = param.Integer(default=-1, precedence=-1)
+class TilingState(param.Parameterized):
+    """The design, its history and the selection, as seen by the components."""
 
-    # Reset button state
-    reset_available = param.Boolean(
-        default=False, precedence=-1, doc="Whether reset is available (parameters are not initial)"
-    )
+    draft = param.ClassSelector(class_=Draft, doc="The current design; always a valid prototile")
+    # Parts of the draft, set together with it so that a component can depend on the part it draws.
+    tiling_type = param.Integer(doc="Type number of the draft")
+    parameters = param.Parameter(doc="Tuple of the parameters of the draft")
+    edge_curve_modes = param.Dict(doc="Shape id -> linear or spline, of the draft")
+    history_rev = param.Integer(default=0, doc="Incremented when the draft, the history or the baseline changes")
+    source_label = param.String(default=DEFAULT_PRESET, doc="Preset name or file description; stem of file names")
+    active_curve_id = param.Integer(default=None, allow_None=True)
+    view = param.ClassSelector(class_=ViewSettings, constant=True)
 
-    def __init__(self, **params):
-        super().__init__(**params)
-        # Coalescing state for push_history (plain instance attrs, not reactive)
-        self._last_coalesce_key = None
-        self._last_coalesce_time = None
-        # Initialize tiling with a preset - watcher doesn't fire on init
-        # Use regular_hexagon preset like the Streamlit app
-        tiling = IsohedralTiling.from_preset("regular_hexagon")
-        self.tiling_type = tiling._type
-        self.parameters = list(tiling._ih.parameters)
-        self.edge_curves = dict(tiling._edge_curves) if tiling._edge_curves else {}
-        self.edge_curve_modes = dict(tiling._edge_curve_modes)
-        self._tiling = tiling
-        self._type_info = tiling.type_info()
-        # Set active curve to first customizable edge
-        customizable = self._type_info.get("customizable_shape_ids", [])
-        if customizable:
-            self.active_curve_id = customizable[0]
-        # Set flag to reset ranges on first draw
-        self._reset_ranges = True
-        # Save initial state
-        self._initial_parameters = list(tiling._ih.parameters)
-        self._initial_edge_curves = dict(tiling._edge_curves) if tiling._edge_curves else {}
-        self._initial_preset_name = "regular_hexagon"
-        self._initial_prototile_svg = self._generate_prototile_svg(tiling)
-        # Push initial state to history
-        self.push_history("Initial state")
-        # Initial reset state
-        self.reset_available = False
-
-    @param.depends("tiling_type", "parameters", watch=True)
-    def _update_tiling(self):
-        """Rebuild tiling when type or parameters change.
-
-        Note: edge_curves changes don't require rebuilding the tiling object,
-        they only affect edge shapes which are handled separately.
-        """
-        if self._batching:
-            return  # Skip during batch operations
-
-        # Check if tiling type is changing
-        type_changed = hasattr(self, "_tiling") and self.tiling_type != self._tiling._type
-        if type_changed:
-            self._reset_ranges = True
-        # Get expected parameter count for current type
-        info = IsohedralTiling.type_info(self.tiling_type)
-        expected_len = len(info["parameters"])
-
-        # If parameters length doesn't match, use defaults
-        params = [p["default"] for p in info["parameters"]] if len(self.parameters) != expected_len else self.parameters
-
-        self._tiling = IsohedralTiling(tiling_type=self.tiling_type, parameters=params, edge_curves=self.edge_curves)
-        new_type_info = self._tiling.type_info()
-
-        # Set active_curve_id BEFORE _type_info so that reactive components
-        # (curve editor selector row) always see a consistent pair.
-        # On a type change always reset to the first customizable curve so the
-        # editor never shows a stale / I-type edge from the previous tile.
-        customizable = new_type_info.get("customizable_shape_ids", [])
-        if type_changed or self.active_curve_id not in customizable:
-            self.active_curve_id = customizable[0] if customizable else None
-
-        self._type_info = new_type_info
-
-        # Update reset button state
-        current_snapshot = self._snapshot()
-        initial_snapshot = {
-            "tiling_type": self.tiling_type,
-            "parameters": list(self._initial_parameters)
-            if self._initial_parameters
-            else [p["default"] for p in info["parameters"]],
-            "edge_curves": dict(self._initial_edge_curves) if self._initial_edge_curves else {},
-            "edge_curve_modes": dict(self.edge_curve_modes),
-            "active_curve_id": self.active_curve_id,
-        }
-        self.reset_available = not self._snapshot_equals(current_snapshot, initial_snapshot)
-
-    @param.depends("edge_curves", watch=True)
-    def _on_edge_curves_change(self):
-        """Handle edge curves change with async debounced update.
-
-        This updates the tiling preview asynchronously while keeping
-        the UI responsive. Multiple rapid changes are squashed into one.
-        """
-        if self._batching:
-            return
-        # Update the tiling's edge curves without full rebuild
-        if self._tiling is not None:
-            self._tiling._edge_curves = dict(self.edge_curves)
-        # Update reset button state
-        current_snapshot = self._snapshot()
-        initial_snapshot = {
-            "tiling_type": self.tiling_type,
-            "parameters": list(self._initial_parameters)
-            if self._initial_parameters
-            else [p["default"] for p in IsohedralTiling.type_info(self.tiling_type)["parameters"]],
-            "edge_curves": dict(self._initial_edge_curves) if self._initial_edge_curves else {},
-            "edge_curve_modes": dict(self.edge_curve_modes),
-            "active_curve_id": self.active_curve_id,
-        }
-        self.reset_available = not self._snapshot_equals(current_snapshot, initial_snapshot)
-
-    @param.depends("edge_curve_modes", watch=True)
-    def _on_edge_curve_modes_change(self):
-        """Handle edge curve modes change."""
-        if self._batching:
-            return
-        # Update the tiling's edge curve modes without full rebuild
-        if self._tiling is not None:
-            self._tiling._edge_curve_modes = dict(self.edge_curve_modes)
-
-    def _do_async_update(self):
-        """Perform the actual async update and notify watchers."""
-        # Trigger param event to notify watchers (like preview strip)
-        self.param.trigger("_tiling")
-
-    def reset_parameters(self):
-        """Reset to initial parameters and push the resulting state to history."""
-        # Check if already at initial state
-        current_snapshot = self._snapshot()
-        initial_snapshot = {
-            "tiling_type": self.tiling_type,
-            "parameters": list(self._initial_parameters)
-            if self._initial_parameters
-            else [p["default"] for p in IsohedralTiling.type_info(self.tiling_type)["parameters"]],
-            "edge_curves": dict(self._initial_edge_curves) if self._initial_edge_curves else {},
-            "edge_curve_modes": dict(self.edge_curve_modes),
-            "active_curve_id": self.active_curve_id,
-        }
-
-        if self._snapshot_equals(current_snapshot, initial_snapshot):
-            print("DEBUG: History reset → already at initial state, skipping")
-            return
-
-        with self.batch_update():
-            if self._initial_parameters:
-                self.parameters = list(self._initial_parameters)
-                self.edge_curves = dict(self._initial_edge_curves)
-            else:
-                info = IsohedralTiling.type_info(self.tiling_type)
-                self.parameters = [p["default"] for p in info["parameters"]]
-        # batch_update.__exit__ calls _update_tiling() once with all values set
-        self.parameters_version += 1
-        # Push the reset state to history so it is undoable
-        reset_label = (
-            self._initial_preset_name.replace("_", " ").title()
-            if self._initial_preset_name
-            else f"IH{self.tiling_type}"
+    def __init__(self, notify: Notify | None = None, **params: Any):
+        model = EditorModel()
+        customizable = type_info(model.draft.type_number)["customizable_shape_ids"]
+        super().__init__(
+            draft=model.draft,
+            tiling_type=model.draft.type_number,
+            parameters=model.draft.parameters,
+            edge_curve_modes=model.draft.mode_dict,
+            active_curve_id=customizable[0] if customizable else None,
+            view=ViewSettings(),
+            **params,
         )
-        self.push_history(f"Reset to {reset_label}", force_new=True)
-        # Update reset availability
-        self.reset_available = False
+        self.model = model
+        self.notify: Notify = notify or panel_notify
+        self.reset_ranges = True  # the prototile editor fits its axes to the next draft, then clears the flag
+        self._prototile_svg = self._baseline_icon()
 
-    def set_initial_state(self, tiling):
-        """Set initial state from a tiling instance (for type selection)."""
-        self._initial_parameters = list(tiling._ih.parameters)
-        self._initial_edge_curves = dict(tiling._edge_curves) if tiling._edge_curves else {}
-        self._initial_preset_name = ""
-        self._initial_prototile_svg = self._generate_prototile_svg(tiling)
-        # Reset button should be disabled when at initial state
-        self.reset_available = False
+    # -- views of the draft ----------------------------------------------------------------------------
 
-    def _generate_prototile_svg(self, tiling) -> str:
-        """Generate SVG of prototile for reference image."""
-        verts = list(tiling._unit_tile.exterior.coords[:-1])
-        xs = [v[0] for v in verts]
-        ys = [v[1] for v in verts]
+    @property
+    def tiling(self) -> IsohedralTiling:
+        return self.draft.tiling()
 
-        span = max(max(xs) - min(xs), max(ys) - min(ys)) or 1.0
-        size = 60
-        pad = 2
-        scale = (size - 4) / span
+    @property
+    def type_info(self) -> dict[str, Any]:
+        """The metadata of the current type (shared, do not modify)."""
+        return type_info(self.draft.type_number)
 
-        pts = " ".join(f"{pad + (x - min(xs)) * scale:.1f},{pad + (max(ys) - y) * scale:.1f}" for x, y in verts)
+    @property
+    def edge_curves(self) -> dict[int, tuple[tuple[float, float], ...]]:
+        return self.draft.curve_dict
 
-        num_vertices = tiling.type_info().get("num_vertices")
-        colors = {3: "#f5b7b1", 4: "#aed6f1", 5: "#f9e79f", 6: "#abebc6"}
-        fill_color = colors.get(num_vertices, "#d5d8dc")
+    def shape_type(self, shape_id: int | None) -> str:
+        """The edge shape of a shape id of the current type; J if the id is None."""
+        return "J" if shape_id is None else shape_of(self.draft.type_number, shape_id)
 
-        return (
-            f'<svg width="{size}" height="{size}" xmlns="http://www.w3.org/2000/svg">'
-            f'<polygon points="{pts}" fill="{fill_color}" '
-            f'stroke="#1971c2" stroke-width="1"/>'
-            f"</svg>"
-        )
+    @property
+    def default_name(self) -> str:
+        """Stem of file names: the preset name or file description, else IH<n>."""
+        return self.source_label or f"IH{self.draft.type_number}"
 
-    def load_preset(self, preset_name: str):
-        """Load a preset tiling configuration."""
-        tiling = IsohedralTiling.from_preset(preset_name)
+    # -- history and baseline --------------------------------------------------------------------------
 
-        with self.batch_update():
-            self.tiling_type = tiling._type
-            self.parameters = list(tiling._ih.parameters)
-            self.edge_curves = dict(tiling._edge_curves) if tiling._edge_curves else {}
-            self.edge_curve_modes = dict(tiling._edge_curve_modes)
-            self.current_preset = preset_name
-            # Reset active_curve_id to first customizable curve
-            info = tiling.type_info()
-            customizable = info.get("customizable_shape_ids", [])
-            if customizable:
-                self.active_curve_id = customizable[0]
-            self._reset_ranges = True  # Set flag inside batch update
-            self.parameters_version += 1
-            # Save initial state for this preset
-            self._initial_parameters = list(tiling._ih.parameters)
-            self._initial_edge_curves = dict(tiling._edge_curves) if tiling._edge_curves else {}
-            self._initial_preset_name = preset_name
-            self._initial_prototile_svg = self._generate_prototile_svg(tiling)
-            # Reset button should be disabled when at initial state
-            self.reset_available = False
-        # Clear history and make new preset the first (and only) entry
-        preset_label = preset_name.replace("_", " ").title()
-        initial_snapshot = self._snapshot(f"Load preset '{preset_label}'")
-        self._history = [initial_snapshot]
-        self._history_idx = 0
-        self._last_coalesce_key = None
-        self._last_coalesce_time = None
-        print(f"DEBUG: History cleared and load_preset:{preset_name} → index 0 (length: 1)")
+    @property
+    def can_undo(self) -> bool:
+        return self.model.can_undo
 
-    def _snapshot(self, description: str = "") -> dict:
-        """Create a state snapshot for undo/redo.
+    @property
+    def can_redo(self) -> bool:
+        return self.model.can_redo
 
-        Args:
-            description: Human-readable label for what action produced this state,
-                         shown in the undo/redo toolbar buttons.
-        """
-        return {
-            "tiling_type": self.tiling_type,
-            "parameters": list(self.parameters),
-            "edge_curves": {k: list(v) for k, v in self.edge_curves.items()},
-            "edge_curve_modes": dict(self.edge_curve_modes),
-            "active_curve_id": self.active_curve_id,
-            "description": description,
-        }
+    @property
+    def reset_available(self) -> bool:
+        return self.model.can_reset
 
-    def push_history(
-        self,
-        description: str = "",
-        coalesce_key: str | None = None,
-        coalesce_window_ms: int = 1500,
-        force_new: bool = False,
-    ):
-        """Save current state to history.
+    @property
+    def baseline_label(self) -> str:
+        return self.model.baseline_label
 
-        Args:
-            description: Human-readable label shown in the undo/redo toolbar.
-            coalesce_key: If set and the previous push used the same key within
-                          ``coalesce_window_ms`` ms, the last entry is replaced
-                          in-place rather than appending a new one (idle-window
-                          coalescing).
-            coalesce_window_ms: Maximum gap between two pushes for them to
-                                coalesce. The window is measured between any two
-                                consecutive pushes, not from the first one.
-            force_new: If True, always append a new entry, bypassing both the
-                       duplicate check and coalescing.
-        """
-        snapshot = self._snapshot(description)
+    @property
+    def baseline_svg(self) -> str:
+        """SVG icon of the prototile of the baseline (the target of Reset)."""
+        return self._prototile_svg
 
-        # 1. Deduplication guard (preserves fix for double-fire bug)
-        if (
-            not force_new
-            and self._history
-            and self._history_idx >= 0
-            and self._snapshot_equals(snapshot, self._history[self._history_idx])
-        ):
-            print(f"DEBUG: History '{description}' → skipping duplicate")
-            return
+    def undo(self) -> None:
+        self.model.undo()
+        self._publish(reset_ranges=True)
 
-        now = datetime.now()
+    def redo(self) -> None:
+        self.model.redo()
+        self._publish(reset_ranges=True)
 
-        # 2. Coalescing: replace last entry if same key within the idle window
-        should_coalesce = (
-            not force_new
-            and coalesce_key is not None
-            and self._last_coalesce_key == coalesce_key
-            and self._last_coalesce_time is not None
-            and (now - self._last_coalesce_time).total_seconds() * 1000 < coalesce_window_ms
-            and self._history_idx >= 0
-        )
+    def reset(self) -> None:
+        self._commit(self.model.baseline, f"Reset to {self.baseline_label}")
 
-        if should_coalesce:
-            self._history[self._history_idx] = snapshot
-            print(f"DEBUG: History '{description}' → coalesced at index {self._history_idx}")
-        else:
-            # 3. Normal append
-            self._history = self._history[: self._history_idx + 1]
-            self._history.append(snapshot)
-            self._history_idx += 1
-            print(f"DEBUG: History '{description}' → added at index {self._history_idx} (length: {len(self._history)})")
+    # -- loading ---------------------------------------------------------------------------------------
 
-        self._last_coalesce_time = now
-        self._last_coalesce_key = coalesce_key
+    def load_type(self, number: int) -> None:
+        self.model.load_type(number)
+        self._publish(reset_ranges=True, new_baseline=True, source_label="")
 
-    def _snapshot_equals(self, state1, state2):
-        """Check if two state snapshots are equals for history purposes."""
-        # Compare important fields with tolerance
-        if state1["tiling_type"] != state2["tiling_type"]:
+    def load_preset(self, name: str) -> None:
+        self.model.load_preset(name)
+        self._publish(reset_ranges=True, new_baseline=True, source_label=name)
+
+    def load_data(self, data: Any, name: str = "") -> bool:
+        """Load a design from parsed JSON. Notifies the repairs; on an error notifies it and keeps the state."""
+        try:
+            notes = self.model.load_data(data, name)
+        except ValueError as e:
+            self.notify("error", f"Failed to load: {e}")
             return False
-        if len(state1["parameters"]) != len(state2["parameters"]):
-            return False
-        for p1, p2 in zip(state1["parameters"], state2["parameters"], strict=False):
-            if abs(p1 - p2) > 1e-9:
-                return False
-        # Other fields can be compared directly
-        return (
-            state1["edge_curves"] == state2["edge_curves"]
-            and state1["edge_curve_modes"] == state2["edge_curve_modes"]
-            and state1["active_curve_id"] == state2["active_curve_id"]
+        self._publish(reset_ranges=True, new_baseline=True, source_label=name)
+        for note in notes:
+            self.notify("warning", f"Design repaired: {note}")
+        return True
+
+    # -- edits -----------------------------------------------------------------------------------------
+
+    def set_parameter(self, index: int, value: float, label: str) -> bool:
+        params = list(self.draft.parameters)
+        params[index] = float(value)
+        return self._commit(self.draft.with_parameters(params), label, f"param{index}", 1.0)
+
+    def set_parameters(self, values: Any, label: str = "Move prototile vertices") -> bool:
+        return self._commit(self.draft.with_parameters(values), label)
+
+    def set_curve(
+        self, shape_id: int, curve: Any, label: str, key: str | None = None, window: float | None = None
+    ) -> bool:
+        """Set the control polygon of a shape id; the symmetry of its edge shape is enforced."""
+        curve = enforce_symmetry(curve, self.shape_type(shape_id))
+        return self._commit(self.draft.with_curve(shape_id, curve), label, key, window)
+
+    def move_node(
+        self, shape_id: int, i: int, x: float, y: float, label: str, key: str | None = None, window: float | None = None
+    ) -> bool:
+        curve = move_node(self.draft.curve(shape_id), self.shape_type(shape_id), i, x, y)
+        return self._commit(self.draft.with_curve(shape_id, curve), label, key, window)
+
+    def add_node(self, shape_id: int, x: float, y: float) -> bool:
+        curve = add_node(self.draft.curve(shape_id), self.shape_type(shape_id), x, y)
+        return self._commit(self.draft.with_curve(shape_id, curve), f"Add point to curve {shape_id}")
+
+    def remove_node(self, shape_id: int, i: int) -> bool:
+        curve = remove_node(self.draft.curve(shape_id), self.shape_type(shape_id), i)
+        return self._commit(self.draft.with_curve(shape_id, curve), f"Remove point from curve {shape_id}")
+
+    def set_mode(self, shape_id: int, mode: str) -> bool:
+        return self._commit(self.draft.with_mode(shape_id, mode), f"Curve {shape_id}: {mode}")
+
+    def copy_curve(self, source_id: int, target_id: int) -> bool:
+        return self.set_curve(target_id, self.draft.curve(source_id), f"Copy curve {source_id} → {target_id}")
+
+    # -- internals -------------------------------------------------------------------------------------
+
+    def _commit(self, draft: Draft, label: str, key: str | None = None, window: float | None = None) -> bool:
+        result = self.model.commit(label, draft, key, window)
+        if result.committed:
+            if self.model.draft != self.draft:
+                self._publish()
+            return True
+        self.notify("error", f"Not applied ({label}): {result.report.message}")
+        # The views may show the refused input; redraw them from the current draft
+        self.param.trigger("draft", "parameters", "edge_curve_modes")
+        return False
+
+    def _baseline_icon(self) -> str:
+        draft = self.model.baseline
+        return prototile_svg(
+            draft.tiling().prototile(normalized=True), type_info(draft.type_number)["num_vertices"], 60
         )
 
-    def undo(self):
-        if self._history_idx > 0:
-            prev_idx = self._history_idx
-            self._history_idx -= 1
-            state = self._history[self._history_idx]
-            print(f"DEBUG: History undo → from index {prev_idx} to {self._history_idx} (length: {len(self._history)})")
-            print(f"DEBUG: Restoring parameters: {state['parameters']}")
-            self._restore(state)
-
-    def redo(self):
-        if self._history_idx < len(self._history) - 1:
-            prev_idx = self._history_idx
-            self._history_idx += 1
-            state = self._history[self._history_idx]
-            print(f"DEBUG: History redo → from index {prev_idx} to {self._history_idx} (length: {len(self._history)})")
-            print(f"DEBUG: Restoring parameters: {state['parameters']}")
-            self._restore(state)
-
-    def _restore(self, state: dict):
-        """Restore state from snapshot."""
-        with self.batch_update():
-            self.tiling_type = state["tiling_type"]
-            self.parameters = state["parameters"]
-            self.edge_curves = state["edge_curves"]
-            self.edge_curve_modes = state["edge_curve_modes"]
-            self.active_curve_id = state["active_curve_id"]
-            self._reset_ranges = True
-        # batch_update.__exit__ calls _update_tiling() exactly once
+    def _publish(self, reset_ranges: bool = False, new_baseline: bool = False, source_label: str | None = None) -> None:
+        draft = self.model.draft
+        if reset_ranges:
+            self.reset_ranges = True
+        if new_baseline:
+            self._prototile_svg = self._baseline_icon()
+        customizable = type_info(draft.type_number)["customizable_shape_ids"]
+        active = self.active_curve_id
+        if new_baseline or draft.type_number != self.draft.type_number or active not in customizable:
+            active = customizable[0] if customizable else None
+        same = draft is self.draft  # param fires for any other object, equal or not
+        updates: dict[str, Any] = {
+            "draft": draft,
+            "tiling_type": draft.type_number,
+            "parameters": draft.parameters,
+            "edge_curve_modes": draft.mode_dict,
+            "active_curve_id": active,
+            "history_rev": self.history_rev + 1,
+        }
+        if source_label is not None:
+            updates["source_label"] = source_label
+        self.param.update(**updates)
+        if same:
+            self.param.trigger("draft", "parameters", "edge_curve_modes")

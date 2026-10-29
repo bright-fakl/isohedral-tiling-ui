@@ -18,20 +18,21 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "carto-flow>=1.1.1",
-    "panel>=1.4",
+    "isotile @ https://github.com/bright-fakl/isotile/archive/c1535fc40cd7e75d59ca45b5ddc4874daf82b87a.zip",
+    "numpy>=2.2",
+    "pandas>=2.3",
+    "panel>=1.9",
     "param>=2.1",
-    "bokeh>=3.4",
+    "bokeh>=3.9",
     "svgwrite>=1.4",
     "matplotlib>=3.9",
-    "shapely>=2.1",
 ]
 
 [project.scripts]
 isohedral-tiling-ui = "isohedral_tiling_ui:launch_ui"
 
 [project.urls]
-Repository = "https://github.com/bright-fakl/carto-flow"
+Repository = "https://github.com/bright-fakl/isohedral-tiling-ui"
 
 [dependency-groups]
 dev = [
@@ -44,6 +45,9 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/isohedral_tiling_ui"]
@@ -64,8 +68,7 @@ module = [
     "bokeh.*",
     "svgwrite.*",
     "matplotlib.*",
-    "shapely.*",
-    "tactile.*",
+    "pandas.*",
 ]
 ignore_missing_imports = true
 

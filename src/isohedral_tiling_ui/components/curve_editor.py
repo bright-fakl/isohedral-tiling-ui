@@ -2,35 +2,70 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import panel as pn
 import param
 from bokeh.events import DoubleTap
 from bokeh.models import ColumnDataSource, CustomJS
 from bokeh.plotting import figure
+from isotile import interpolate
+
+from isohedral_tiling_ui.components.icon_button import icon_button
+from isohedral_tiling_ui.editor_model import editable, preset_availability, preset_curve
+from isohedral_tiling_ui.utils.curve_presets import get_curve_preset, list_curve_presets
+
+SELECTED_FILL, SELECTED_LINE = "crimson", "#7a0000"
+NODE_FILL, NODE_LINE = "#444", "#111"
+FIXED_FILL, FIXED_LINE = "#ccc", "#999"
 
 
 class CurveEditor(pn.viewable.Viewer):
     """Edge curve editor with draggable control points."""
 
     state = param.ClassSelector(class_=param.Parameterized)
-    selected_point_idx = param.Integer(default=1)
 
     def __init__(self, **params):
         super().__init__(**params)
         self._cp_source = ColumnDataSource(
-            data={"x": [], "y": [], "idx": [], "editable": [], "fill_color": [], "line_color": [], "edge_shape": []}
+            data={
+                "x": [],
+                "y": [],
+                "idx": [],
+                "editable": [],
+                "fill_color": [],
+                "line_color": [],
+                "edge_shape": [],
+            },
+            name="movable_nodes",
         )
+        # Indices (in the curve) of the selected movable nodes. Kept apart from the selection of the source, which
+        # PointDrawTool clears at the end of every drag.
+        self._selection_source = ColumnDataSource(data={"idx": []})
+        self._selection_curve_id: int | None = None
         # Separate source for fixed (non-editable) points - not connected to PointDrawTool
-        self._fixed_cp_source = ColumnDataSource(data={"x": [], "y": [], "idx": [], "fill_color": [], "line_color": []})
-        self._curve_source = ColumnDataSource(data={"x": [], "y": []})
+        self._fixed_cp_source = ColumnDataSource(
+            data={"x": [], "y": [], "idx": [], "fill_color": [], "line_color": []}, name="fixed_nodes"
+        )
+        self._curve_source = ColumnDataSource(data={"x": [], "y": []}, name="curve")
         self._baseline_source = ColumnDataSource(data={"x": [0, 1], "y": [0, 0]})
         self._updating_from_state = False  # Flag to prevent circular updates
         self._programmatic_cp_update = False  # Flag to skip history push on programmatic cp_source writes
         self._y_scale = 1.0  # Y-axis scale factor (default ±1)
+        self._preset_buttons: dict[str, pn.widgets.Button] = {}
+        # name -> reason a preset is unavailable ("" if available); the button is muted and a click is ignored
+        self._preset_reasons: dict[str, str] = {}
+        self._preset_grid = self._build_preset_buttons()
         self._figure = self._build_figure()
+        self._plot_row = pn.Row(
+            pn.pane.Bokeh(self._figure, height=210, sizing_mode="stretch_width"),
+            self._preset_grid,
+            sizing_mode="stretch_width",
+        )
         self._setup_callbacks()
         # Initialize with current state values since @param.depends doesn't fire on init
         self._update_figure()
+        self._refresh_presets()
 
     def _build_figure(self):
         """Build the Bokeh curve editor figure."""
@@ -100,6 +135,9 @@ class CurveEditor(pn.viewable.Viewer):
             fill_color="fill_color",
             line_color="line_color",
         )
+        # the node colors come from the columns, not from the selection of the source
+        self._cp_renderer.selection_glyph = None
+        self._cp_renderer.nonselection_glyph = None
 
         # Add text labels for editable control points
         from bokeh.models import LabelSet
@@ -127,6 +165,7 @@ class CurveEditor(pn.viewable.Viewer):
         p.toolbar.active_tap = draw
 
         p.on_event(DoubleTap, self._on_double_tap)
+        self._add_selection_callbacks(p)
 
         # Use pan event for live feedback during drag
         # Pan fires continuously during drag operations
@@ -251,85 +290,146 @@ class CurveEditor(pn.viewable.Viewer):
 
         return p
 
+    def _add_selection_callbacks(self, p) -> None:
+        """Select nodes by clicking or dragging (shift-click adds to the selection); the selection survives drags.
+
+        The selected nodes are crimson, the other movable nodes dark gray. PointDrawTool selects the node under the
+        pointer, adds with shift, moves all selected nodes together when one of them is dragged, and clears the
+        selection when a drag ends. The selection is copied to ``_selection_source`` and put back after a drag.
+        """
+        args = {
+            "cp_source": self._cp_source,
+            "sel_source": self._selection_source,
+            "style": {"fill": SELECTED_FILL, "line": SELECTED_LINE, "node_fill": NODE_FILL, "node_line": NODE_LINE},
+        }
+        recolor = """
+        const picked = sel_source.data.idx;
+        const pd = cp_source.data;
+        for (let i = 0; i < pd.idx.length; i++) {
+            const on = picked.includes(pd.idx[i]);
+            pd.fill_color[i] = on ? style.fill : style.node_fill;
+            pd.line_color[i] = on ? style.line : style.node_line;
+        }
+        cp_source.change.emit();
+        """
+        on_indices = CustomJS(
+            args=args,
+            code="""
+            const k = cp_source.selected.indices;
+            if (cp_source._panning && k.length === 0) return;  // the end of a drag
+            const chosen = Array.from(k, i => cp_source.data.idx[i]).sort((a, b) => a - b);
+            const old = sel_source.data.idx;
+            if (old.length === chosen.length && old.every((v, i) => v === chosen[i])) return;
+            cp_source._before = {idx: Array.from(old), time: performance.now()};  // for the start of a drag
+            sel_source.data = {idx: chosen};
+            """
+            + recolor,
+        )
+        self._cp_source.selected.js_on_change("indices", on_indices)
+        # a drag that starts on a node outside the selection (without shift) selects that node only
+        p.js_on_event(
+            "panstart",
+            CustomJS(
+                args={"cp_source": self._cp_source, "sel_source": self._selection_source, "fig": p},
+                code="""
+                cp_source._panning = true;
+                if (cb_obj.modifiers && cb_obj.modifiers.shift) return;
+                const v = Bokeh.index.find_one(fig), d = cp_source.data;
+                // the selection before the tool selected the node under the pointer
+                const b = cp_source._before;
+                const before = b && performance.now() - b.time < 100 ? b.idx : Array.from(sel_source.data.idx);
+                let hit = -1, best = 12;
+                for (let i = 0; i < d.x.length; i++) {
+                    const dist = Math.hypot(v.frame.x_scale.compute(d.x[i]) - cb_obj.sx,
+                                            v.frame.y_scale.compute(d.y[i]) - cb_obj.sy);
+                    if (dist < best) { best = dist; hit = i; }
+                }
+                if (hit >= 0 && !before.includes(d.idx[hit])) cp_source.selected.indices = [hit];
+                """,
+            ),
+        )
+        # after a drag the tool has cleared its selection: select the nodes again, so the next drag moves them all
+        p.js_on_event(
+            "panend",
+            CustomJS(
+                args={"cp_source": self._cp_source, "sel_source": self._selection_source},
+                code="""
+                setTimeout(() => {
+                    cp_source._panning = false;
+                    const chosen = sel_source.data.idx, d = cp_source.data;
+                    const k = [];
+                    for (let i = 0; i < d.idx.length; i++) if (chosen.includes(d.idx[i])) k.push(i);
+                    if (k.length) cp_source.selected.indices = k;
+                }, 0);
+                """,
+            ),
+        )
+        # a click on empty space leaves the source without selection, a click on a node leaves it selected
+        p.js_on_event(
+            "tap",
+            CustomJS(
+                args=args,
+                code="""
+                setTimeout(() => {
+                    if (cp_source.selected.indices.length === 0 && sel_source.data.idx.length) {
+                        sel_source.data = {idx: []};
+                        """
+                + recolor
+                + """
+                    }
+                }, 0);
+                """,
+            ),
+        )
+
     def _setup_callbacks(self):
         """Set up callbacks for drag and selection."""
         # Only use Python callback - JS pan event handles live feedback during drag
         self._cp_source.on_change("data", self._on_curve_change)
 
-    @param.depends(
-        "state._tiling",
-        "state.active_curve_id",
-        "state.edge_curves",
-        "state.edge_curve_modes",
-        "state._type_info",
-        "state.parameters_version",
-        watch=True,
-    )
+    @param.depends("state.draft", "state.active_curve_id", watch=True)
     def _update_figure(self):
         """Update curve visualization."""
         # Skip if we're in the middle of updating from a drag operation
         if self._updating_from_state:
             return
 
-        # Skip during batch updates - wait for _type_info to be updated
-        if hasattr(self.state, "_batching") and self.state._batching:
-            return
-
         curve_id = self.state.active_curve_id
-        if curve_id is None:
+        self._plot_row.visible = curve_id is not None
+        if curve_id is None:  # the type has no curve to edit: show nothing of the previous one
+            self._show_no_curve()
             return
 
-        curve = self.state.edge_curves.get(curve_id, [(0, 0), (1, 0)])
+        curve = self.state.draft.curve(curve_id)
         n = len(curve)
+        edge_shape = self.state.shape_type(curve_id)
 
-        info = self.state._type_info
-        if info is None:
-            print("[DEBUG] _update_figure: _type_info is None, skipping")
-            return
-        edge_shape = next((e["shape_type"] for e in info["edges"] if e["shape_id"] == curve_id), "J")
+        # Keep the selected nodes while the curve keeps them
+        kept = [
+            i
+            for i in self._selection_source.data["idx"]
+            if curve_id == self._selection_curve_id and i < n and editable(edge_shape, n, i)
+        ]
+        self._selection_curve_id = curve_id
+        if kept != list(self._selection_source.data["idx"]):
+            self._selection_source.data = {"idx": kept}
 
         # Separate editable and fixed points
-        editable_x = []
-        editable_y = []
-        editable_idx = []
-        editable_fill_color = []
-        editable_line_color = []
-
-        fixed_x = []
-        fixed_y = []
-        fixed_idx = []
-        fixed_fill_color = []
-        fixed_line_color = []
-
-        (n - 1) / 2
+        editable_x, editable_y, editable_idx = [], [], []
+        editable_fill_color, editable_line_color = [], []
+        fixed_x, fixed_y, fixed_idx = [], [], []
 
         for i in range(n):
-            is_editable = self._is_editable(i, n, edge_shape)
-
-            # Determine color
-            if i == self.selected_point_idx:
-                fill = "crimson"
-                line = "#7a0000"
-            elif not is_editable:
-                # Non-editable points (endpoints, S midpoint, mirrored points)
-                fill = "#ccc"
-                line = "#999"
-            else:
-                fill = "#444"
-                line = "#111"
-
-            if is_editable:
+            if editable(edge_shape, n, i):
                 editable_x.append(curve[i][0])
                 editable_y.append(curve[i][1])
                 editable_idx.append(i)
-                editable_fill_color.append(fill)
-                editable_line_color.append(line)
+                editable_fill_color.append(SELECTED_FILL if i in kept else NODE_FILL)
+                editable_line_color.append(SELECTED_LINE if i in kept else NODE_LINE)
             else:
                 fixed_x.append(curve[i][0])
                 fixed_y.append(curve[i][1])
                 fixed_idx.append(i)
-                fixed_fill_color.append(fill)
-                fixed_line_color.append(line)
 
         # Update editable and fixed points sources.
         # Wrap in _programmatic_cp_update so _on_curve_change skips history push.
@@ -349,32 +449,31 @@ class CurveEditor(pn.viewable.Viewer):
                 "x": fixed_x,
                 "y": fixed_y,
                 "idx": fixed_idx,
-                "fill_color": fixed_fill_color,
-                "line_color": fixed_line_color,
+                "fill_color": [FIXED_FILL] * len(fixed_x),
+                "line_color": [FIXED_LINE] * len(fixed_x),
             }
         finally:
             self._programmatic_cp_update = False
+        self._cp_source.selected.indices = [k for k, i in enumerate(editable_idx) if i in kept]
 
-        # Get mode from state.edge_curve_modes for this curve
-        curve_mode = self.state.edge_curve_modes.get(curve_id, "spline")
-        curve_pts = self._interpolate_spline(curve) if curve_mode == "spline" and n >= 3 else curve
+        self._show_curve(curve_id, curve)
 
-        self._curve_source.data = {"x": [p[0] for p in curve_pts], "y": [p[1] for p in curve_pts]}
+    def _show_no_curve(self) -> None:
+        """Empty the figure: no curve, no nodes, no selection."""
+        self._selection_curve_id = None
+        self._selection_source.data = {"idx": []}
+        self._programmatic_cp_update = True
+        try:
+            self._cp_source.data = {k: [] for k in self._cp_source.data}
+            self._fixed_cp_source.data = {k: [] for k in self._fixed_cp_source.data}
+        finally:
+            self._programmatic_cp_update = False
+        self._curve_source.data = {"x": [], "y": []}
 
-    def _is_editable(self, i: int, n: int, edge_shape: str) -> bool:
-        if i == 0 or i == n - 1:
-            return False
-        if edge_shape == "S":
-            half = (n - 1) / 2
-            if abs(i - half) < 1e-9:
-                return False  # Midpoint not editable for S curves
-            return i < half + 1e-9
-        if edge_shape == "U":
-            half = (n - 1) / 2
-            if abs(i - half) < 1e-9:
-                return True  # Midpoint IS editable for U curves (y-only)
-            return i < half + 1e-9
-        return True
+    def _show_curve(self, curve_id: int, curve) -> None:
+        """Draw the curve of a shape id in its mode (linear through the control points, or spline)."""
+        pts = interpolate(curve, self.state.draft.mode(curve_id))
+        self._curve_source.data = {"x": pts[:, 0].tolist(), "y": pts[:, 1].tolist()}
 
     def _on_double_tap(self, event):
         """Handle double-click: add point on curve, remove point if on existing control point."""
@@ -385,8 +484,8 @@ class CurveEditor(pn.viewable.Viewer):
         if curve_id is None:
             return
 
-        curve = list(self.state.edge_curves.get(curve_id, [(0, 0), (1, 0)]))
-        edge_shape = self._get_edge_shape()
+        curve = list(self.state.draft.curve(curve_id))
+        edge_shape = self.state.shape_type(curve_id)
 
         # Allow x < 0 and x > 1 for creative freedom
         click_x = event.x
@@ -397,15 +496,9 @@ class CurveEditor(pn.viewable.Viewer):
         for i, (px, py) in enumerate(curve):
             dist = ((px - click_x) ** 2 + (py - click_y) ** 2) ** 0.5
             if dist < threshold:
-                # Double-click on existing point - remove it if editable
-                if self._is_editable(i, len(curve), edge_shape) and len(curve) > 2:
-                    curve.pop(i)
-                    # Enforce symmetry to update mirrored points
-                    curve = self._enforce_symmetry(curve, edge_shape)
-                    curves = dict(self.state.edge_curves)
-                    curves[curve_id] = curve
-                    self.state.edge_curves = curves
-                    self.state.push_history(f"Remove point from curve {curve_id}", force_new=True)
+                # Double-click on existing point - remove it (and its partner on S and U curves) if editable
+                if editable(edge_shape, len(curve), i) and len(curve) > 2:
+                    self.state.remove_node(curve_id, i)
                 return
 
         # Not on existing point - check if near the curve
@@ -413,14 +506,7 @@ class CurveEditor(pn.viewable.Viewer):
         if edge_shape == "U" and click_x > 0.5:
             return
 
-        # Get the curve mode to determine which curve to use for nearness check
-        curve_mode = self.state.edge_curve_modes.get(curve_id, "spline")
-        if curve_mode == "spline" and len(curve) >= 3:
-            # Use spline curve for nearness check
-            curve_pts = self._interpolate_spline(curve)
-        else:
-            # Use linear curve (control points)
-            curve_pts = curve
+        curve_pts = interpolate(curve, self.state.draft.mode(curve_id))
 
         # Check if click is near the curve (within threshold)
         near_curve = False
@@ -432,27 +518,8 @@ class CurveEditor(pn.viewable.Viewer):
                 near_curve = True
                 break
 
-        if not near_curve:
-            return
-
-        # Find insertion point in the control points (not the spline)
-        insert_after = 0
-        for i in range(len(curve) - 1):
-            if curve[i][0] <= click_x:
-                insert_after = i
-
-        curve.insert(insert_after + 1, (click_x, click_y))
-
-        curves = dict(self.state.edge_curves)
-        curves[curve_id] = self._enforce_symmetry(curve, edge_shape)
-        self.state.edge_curves = curves
-        self.state.push_history(f"Add point to curve {curve_id}", force_new=True)
-
-        # Ensure mode is set for this curve (default to spline)
-        if curve_id not in self.state.edge_curve_modes:
-            modes = dict(self.state.edge_curve_modes)
-            modes[curve_id] = "spline"
-            self.state.edge_curve_modes = modes
+        if near_curve:
+            self.state.add_node(curve_id, click_x, click_y)
 
     def _point_near_segment(self, px, py, x1, y1, x2, y2, threshold):
         """Check if point (px, py) is within threshold distance of line segment (x1,y1)-(x2,y2)."""
@@ -475,34 +542,10 @@ class CurveEditor(pn.viewable.Viewer):
         dist = ((px - closest_x) ** 2 + (py - closest_y) ** 2) ** 0.5
         return dist < threshold
 
-    def _on_right_click(self, event):
-        """Handle right-click (contextmenu) event to remove control points"""
-        # Find nearest point to click location
-        data = self._cp_source.data
-        min_dist = float("inf")
-        selected_idx = -1
-
-        for i, (x, y) in enumerate(zip(data["x"], data["y"], strict=False)):
-            dist = (x - event.x) ** 2 + (y - event.y) ** 2
-            if dist < min_dist:
-                min_dist = dist
-                selected_idx = i
-
-        if selected_idx >= 0:
-            self.selected_point_idx = selected_idx
-            # Remove point if it's editable
-            curve_id = self.state.active_curve_id
-            if curve_id is not None:
-                curve = list(self.state.edge_curves.get(curve_id, [(0, 0), (1, 0)]))
-                n = len(curve)
-                edge_shape = self._get_edge_shape()
-                if self._is_editable(selected_idx, n, edge_shape):
-                    self._remove_point_at(selected_idx)
-
     def _on_curve_change(self, attr, old, new):
         """Callback when control points change - updates state directly."""
         if self._programmatic_cp_update:
-            return  # Triggered by _update_figure, not a user drag — skip history push
+            return  # Triggered by _update_figure, not a user drag
         curve_id = self.state.active_curve_id
         if curve_id is None:
             return
@@ -517,132 +560,58 @@ class CurveEditor(pn.viewable.Viewer):
         if not new_x:
             return
 
-        # Get original curve to reconstruct full curve
-        original_curve = list(self.state.edge_curves.get(curve_id, [(0, 0), (1, 0)]))
-        edge_shape = self._get_edge_shape()
-
-        # Clamp coordinates of editable points
-        for i in range(len(new_x)):
-            # Allow x < 0 and x > 1 for creative freedom
-            new_y[i] = max(-self._y_scale, min(self._y_scale, new_y[i]))
-
-        # Reconstruct the full curve by updating editable points
-        curve = list(original_curve)
-        for i, idx in enumerate(new_idx):
+        # Reconstruct the full curve by updating the editable points of the current curve
+        curve = list(self.state.draft.curve(curve_id))
+        edge_shape = self.state.shape_type(curve_id)
+        for x, y, idx in zip(new_x, new_y, new_idx, strict=False):
             if idx < len(curve):
-                curve[idx] = (new_x[i], new_y[i])
+                # Allow x < 0 and x > 1 for creative freedom
+                curve[idx] = (x, max(-self._y_scale, min(self._y_scale, y)))
 
-        # Enforce symmetry
-        curve = self._enforce_symmetry(curve, edge_shape)
-
-        # Set flag to prevent _update_figure from running (circular update)
+        # Set flag to prevent _update_figure from running (circular update). The history entries of one drag
+        # coalesce: a pause longer than 500 ms starts a new entry.
         self._updating_from_state = True
         try:
-            curves = dict(self.state.edge_curves)
-            curves[curve_id] = curve
-            self.state.edge_curves = curves
-
-            # Ensure mode is set for this curve (default to spline)
-            if curve_id not in self.state.edge_curve_modes:
-                modes = dict(self.state.edge_curve_modes)
-                modes[curve_id] = "spline"
-                self.state.edge_curve_modes = modes
+            committed = self.state.set_curve(
+                curve_id,
+                curve,
+                f"Move curve {curve_id} control point",
+                key=f"curve_drag_{curve_id}",
+                window=0.5,
+            )
         finally:
             self._updating_from_state = False
-            # Update curve visualization with spline if needed
-            # (JS callback only provides linear interpolation during drag)
-            curve_mode = self.state.edge_curve_modes.get(curve_id, "spline")
-            if curve_mode == "spline" and len(curve) >= 3:
-                curve_pts = self._interpolate_spline(curve)
-                self._curve_source.data = {"x": [p[0] for p in curve_pts], "y": [p[1] for p in curve_pts]}
+        if not committed:
+            self._update_figure()  # back to the curve of the draft
+            return
 
-            # Update fixed points source
-            n = len(curve)
-            fixed_x = []
-            fixed_y = []
-            fixed_idx = []
-            fixed_fill_color = []
-            fixed_line_color = []
-            (n - 1) / 2
-
-            for i in range(n):
-                is_editable = self._is_editable(i, n, edge_shape)
-                if not is_editable:
-                    fixed_x.append(curve[i][0])
-                    fixed_y.append(curve[i][1])
-                    fixed_idx.append(i)
-
-                    # Non-editable points are gray
-                    fixed_fill_color.append("#ccc")
-                    fixed_line_color.append("#999")
-
-            self._fixed_cp_source.data = {
-                "x": fixed_x,
-                "y": fixed_y,
-                "idx": fixed_idx,
-                "fill_color": fixed_fill_color,
-                "line_color": fixed_line_color,
-            }
-
-        # Push to history after the drag frame settles.
-        # Short coalesce window collapses all drag-frame events into one entry;
-        # a pause longer than 500ms starts a fresh entry.
-        self.state.push_history(
-            f"Move curve {curve_id} control point",
-            coalesce_key=f"curve_drag_{curve_id}",
-            coalesce_window_ms=500,
-        )
-
-    def _enforce_symmetry(self, curve: list, edge_shape: str) -> list:
-        from tactile import EdgeShape
-
-        from isohedral_tiling_ui.utils.symmetry import enforce_curve_symmetry
-
-        sm = {"J": EdgeShape.J, "S": EdgeShape.S, "U": EdgeShape.U, "I": EdgeShape.I}
-        if edge_shape in sm:
-            return enforce_curve_symmetry(curve, sm[edge_shape])
-        return curve
-
-    def _interpolate_spline(self, curve: list) -> list:
-        from isohedral_tiling_ui.utils.spline_cache import interpolate_spline
-
-        return interpolate_spline(curve)
+        # Show the symmetric curve; the JS callback draws only straight lines during the drag
+        curve = self.state.draft.curve(curve_id)
+        self._show_curve(curve_id, curve)
+        n = len(curve)
+        fixed = [i for i in range(n) if not editable(edge_shape, n, i)]
+        self._fixed_cp_source.data = {
+            "x": [curve[i][0] for i in fixed],
+            "y": [curve[i][1] for i in fixed],
+            "idx": fixed,
+            "fill_color": [FIXED_FILL] * len(fixed),
+            "line_color": [FIXED_LINE] * len(fixed),
+        }
 
     def _apply_preset(self, preset_name: str):
-        from tactile import EdgeShape
-
-        from isohedral_tiling_ui.utils.symmetry import enforce_curve_symmetry, get_curve_preset
-
         curve_id = self.state.active_curve_id
         if curve_id is None:
             return
-
-        pts = list(get_curve_preset(preset_name))
-
-        info = self.state._type_info
-        if info is None:
+        if self._preset_reasons.get(preset_name):
             return
-        edge_shape = next((e["shape_type"] for e in info["edges"] if e["shape_id"] == curve_id), "J")
-        sm = {"J": EdgeShape.J, "S": EdgeShape.S, "U": EdgeShape.U, "I": EdgeShape.I}
-        if edge_shape in sm:
-            pts = enforce_curve_symmetry(pts, sm[edge_shape])
-
-        curves = dict(self.state.edge_curves)
-        curves[curve_id] = pts
-        self.state.edge_curves = curves
-
-        # Ensure mode is set for this curve (default to spline)
-        if curve_id not in self.state.edge_curve_modes:
-            modes = dict(self.state.edge_curve_modes)
-            modes[curve_id] = "spline"
-            self.state.edge_curve_modes = modes
-
         preset_label = preset_name.replace("_", " ")
-        self.state.push_history(f"Apply '{preset_label}' to curve {curve_id}", force_new=True)
+        self.state.set_curve(
+            curve_id,
+            preset_curve(preset_name, self.state.shape_type(curve_id)),
+            f"Apply '{preset_label}' to curve {curve_id}",
+        )
 
     def _create_preset_icon(self, preset_name: str) -> str:
-        from isohedral_tiling_ui.utils.symmetry import get_curve_preset
-
         pts = get_curve_preset(preset_name)
         width, height, pad = 24, 24, 3
         inner_width = width - 4
@@ -668,39 +637,29 @@ class CurveEditor(pn.viewable.Viewer):
         return pn.Column(
             pn.pane.Markdown("### Edge Curves"),
             self._build_curve_selector_row,
-            pn.Row(
-                pn.pane.Bokeh(self._figure, height=210, sizing_mode="stretch_width"),
-                self._build_preset_buttons(),
-                sizing_mode="stretch_width",
-            ),
+            self._plot_row,
             self._build_point_inputs,  # Pass as callable for reactivity
             sizing_mode="stretch_width",
             margin=5,
             align=("center", "start"),
         )
 
-    @param.depends("state._type_info", "state.active_curve_id", "state.edge_curve_modes", watch=False)
+    @param.depends("state.tiling_type", "state.active_curve_id", "state.edge_curve_modes", watch=False)
     def _build_curve_selector_row(self):
         """Build combined row with curve selector, info label, and mode widget."""
         if self.state is None:
             return pn.pane.Markdown("*No state set*")
 
-        info = self.state._type_info
-        if info is None:
-            return pn.pane.Markdown("*Loading...*")
-
+        info = self.state.type_info
         customizable = info.get("customizable_shape_ids", [])
         if not customizable:
             return pn.pane.Markdown("*No editable edge curves for this tile type*")
 
         n_curves = len(customizable)
 
-        # Clamp active_curve_id to a valid customizable shape.
-        # active_curve_id may be stale (from a previous tile) during an
-        # intermediate render that occurs between _type_info and active_curve_id
-        # being updated in _update_tiling().  Using display_sid everywhere
-        # prevents the Select widget from auto-correcting to a random option
-        # (which would corrupt active_curve_id via its watcher).
+        # Clamp active_curve_id to a valid customizable shape of the current type.
+        # Using display_sid everywhere prevents the Select widget from auto-correcting to a
+        # random option (which would corrupt active_curve_id via its watcher).
         current_sid = self.state.active_curve_id
         display_sid = current_sid if current_sid in customizable else customizable[0]
 
@@ -801,12 +760,10 @@ class CurveEditor(pn.viewable.Viewer):
                 stylesheets=[":host { padding: 0 !important; margin: 0 !important; }"],
             )
 
-            current_mode = self.state.edge_curve_modes.get(display_sid, "spline")
+            current_mode = self.state.draft.mode(display_sid)
 
             def on_mode_change(event):
-                modes = dict(self.state.edge_curve_modes)
-                modes[display_sid] = event.new
-                self.state.edge_curve_modes = modes
+                self.state.set_mode(display_sid, event.new)
 
             mode_widget = pn.widgets.RadioBoxGroup(
                 options=["linear", "spline"],
@@ -831,32 +788,7 @@ class CurveEditor(pn.viewable.Viewer):
             align="center",
         )
 
-    @param.depends("state.active_curve_id", "state.edge_curve_modes", watch=False)
-    def _build_curve_mode_widget(self):
-        """Build curve mode widget that reads/writes to state.edge_curve_modes."""
-        curve_id = self.state.active_curve_id
-        if curve_id is None:
-            return pn.Spacer()
-
-        current_mode = self.state.edge_curve_modes.get(curve_id, "spline")
-
-        def on_mode_change(event):
-            # Update the mode for the current curve
-            modes = dict(self.state.edge_curve_modes)
-            modes[curve_id] = event.new
-            self.state.edge_curve_modes = modes
-
-        radio = pn.widgets.RadioBoxGroup(
-            options=["linear", "spline"],
-            value=current_mode,
-            inline=True,
-        )
-        radio.param.watch(on_mode_change, "value")
-        return radio
-
     def _build_preset_buttons(self):
-        from isohedral_tiling_ui.utils.symmetry import list_curve_presets
-
         # Preset descriptions for tooltips
         preset_descriptions = {
             "straight": "Straight line",
@@ -878,80 +810,74 @@ class CurveEditor(pn.viewable.Viewer):
             "ramp_down": "Flat then ramp down",
         }
 
+        self._preset_descriptions: dict[str, str] = {}
         presets = list_curve_presets()
         buttons = []
 
         for name in presets:
             svg = self._create_preset_icon(name)
-            # svg_b64 = base64.b64encode(svg.encode('utf-8')).decode('utf-8')
-
             # Get description for tooltip
             desc = preset_descriptions.get(name, name.replace("_", " ").title())
 
-            btn = pn.widgets.ButtonIcon(
-                icon=svg,
+            btn = icon_button(
+                svg,
+                24,
+                lambda e, n=name: self._apply_preset(n),
+                width=30,
+                height=28,
+                margin=1,
                 description=desc,
-                on_click=lambda e, n=name: self._apply_preset(n),
-                size="24px",
+                tags=[f"preset:{name}"],
             )
+            self._preset_buttons[name] = btn
+            self._preset_descriptions[name] = desc
 
-            # btn = pn.widgets.Button(
-            #     name="",
-            #     width=24, height=30, min_width=20,
-            #     margin=(1, 1, 1, 1),
-            #     description=desc,  # Tooltip on hover
-            #     on_click=lambda e, n=name: self._apply_preset(n),
-            #     sizing_mode="fixed"
-            # )
-            # btn.stylesheets = [f"""
-            #     button.bk-btn {{
-            #         background-image: url("data:image/svg+xml;base64,{svg_b64}") !important;
-            #         background-repeat: no-repeat !important;
-            #         background-position: center !important;
-            #         background-size: 24px 24px !important;
-            #         background-color: white !important;
-            #         border: 1px solid #ccc !important;
-            #         border-radius: 4px !important;
-            #         width: 24px !important;
-            #         height: 24px !important;
-            #         padding: 2px !important;
-            #     }}
-            # """]
             buttons.append(btn)
 
         return pn.GridBox(*buttons, ncols=3, sizing_mode="fixed", width=100)
 
-    @param.depends("state.edge_curves", "state.active_curve_id", "state._type_info", "state._batching", watch=False)
-    def _build_point_inputs(self):
-        # Skip during batch updates - wait for _type_info to be updated
-        if hasattr(self.state, "_batching") and self.state._batching:
-            return pn.Spacer()
+    @param.depends("state.draft", "state.active_curve_id", watch=True)
+    def _refresh_presets(self):
+        """Mute the presets that cannot be applied to the selected curve and say why in the tooltip."""
+        curve_id = self.state.active_curve_id
+        if not self._preset_buttons:
+            return
+        if curve_id is None:
+            status = dict.fromkeys(self._preset_buttons, "the tile has no editable curve")
+        else:
+            status = preset_availability(self.state.draft, curve_id)
+        for name, button in self._preset_buttons.items():
+            reason = status[name]
+            description = self._preset_descriptions[name]
+            self._preset_reasons[name] = reason
+            button.description = f"{description}. Not available: {reason}" if reason else description
+            button.styles = {
+                "opacity": "0.35" if reason else "1"
+            }  # both set: a removed style is not cleared in a hidden view
 
+    @param.depends("state.draft", "state.active_curve_id", watch=False)
+    def _build_point_inputs(self):
         curve_id = self.state.active_curve_id
         if curve_id is None:
             return pn.Spacer()
 
-        curve = self.state.edge_curves.get(curve_id, [(0, 0), (1, 0)])
+        curve = self.state.draft.curve(curve_id)
         n = len(curve)
-
-        info = self.state._type_info
-        if info is None:
-            return pn.pane.Markdown("*Loading...*")
-        edge_shape = next((e["shape_type"] for e in info["edges"] if e["shape_id"] == curve_id), "J")
+        edge_shape = self.state.shape_type(curve_id)
 
         # Prepare data for Tabulator
         half = (n - 1) / 2
         table_data = []
         for i, (x, y) in enumerate(curve):
-            editable = self._is_editable(i, n, edge_shape)
+            is_editable = editable(edge_shape, n, i)
             # For U curves, midpoint x is not editable (only y is)
             is_midpoint_u = edge_shape == "U" and abs(i - half) < 1e-9
-            x_editable = editable and not is_midpoint_u
+            x_editable = is_editable and not is_midpoint_u
             table_data.append({
                 "Point": f"P{i}",
                 "X": round(x, 2),
                 "Y": round(y, 2),
-                "Editable": editable,
+                "Editable": is_editable,
                 "XEditable": x_editable,
                 "Index": i,
             })
@@ -1012,9 +938,14 @@ class CurveEditor(pn.viewable.Viewer):
             col = event.column
             value = event.value
             if col == "X":
-                self._on_x_change(idx, value)
+                handler = partial(self._on_x_change, idx, value)
             elif col == "Y":
-                self._on_y_change(idx, value)
+                handler = partial(self._on_y_change, idx, value)
+            else:
+                return
+            # Panel calls on_edit outside the document lock, and the edit changes Bokeh models (the figures):
+            # run it as a scheduled callback.
+            pn.state.execute(handler, schedule=True)
 
         table.on_edit(on_edit)
 
@@ -1022,162 +953,36 @@ class CurveEditor(pn.viewable.Viewer):
             # pn.pane.Markdown("**Control Points:**"),
             pn.pane.Markdown("Double-click on curve to add point, on control point to remove"),
             table,
-            # pn.Row(
-            #     pn.widgets.Button(name="+ Add Point", on_click=self._add_point),
-            #     pn.widgets.Button(name="− Remove Point", on_click=self._remove_point),
-            # ),
-            # height=40
             sizing_mode="stretch_width",
         )
 
     def _on_x_change(self, idx: int, value: float):
-        curve_id = self.state.active_curve_id
-        if curve_id is None:
-            return
-
-        curves = dict(self.state.edge_curves)
-        curve = list(curves.get(curve_id, [(0, 0), (1, 0)]))
-        edge_shape = self._get_edge_shape()
-
-        if idx < len(curve):
-            # For U curves, constrain midpoint x to 0.5
-            n = len(curve)
-            half = (n - 1) / 2
-            if edge_shape == "U" and abs(idx - half) < 1e-9:
-                value = 0.5  # Midpoint x is fixed at 0.5 for U curves
-
-            curve[idx] = (value, curve[idx][1])
-            curves[curve_id] = self._enforce_symmetry(curve, edge_shape)
-            self.state.edge_curves = curves
-            self.state.push_history(
-                f"Edit curve {curve_id} control point",
-                coalesce_key=f"curve_point_{curve_id}",
-                coalesce_window_ms=1000,
-            )
+        self._on_point_change(idx, x=value)
 
     def _on_y_change(self, idx: int, value: float):
+        self._on_point_change(idx, y=value)
+
+    def _on_point_change(self, idx: int, x: float | None = None, y: float | None = None):
+        """Move a node to the value typed in the table; the symmetric partner follows."""
         curve_id = self.state.active_curve_id
         if curve_id is None:
             return
 
-        curves = dict(self.state.edge_curves)
-        curve = list(curves.get(curve_id, [(0, 0), (1, 0)]))
+        curve = self.state.draft.curve(curve_id)
         if idx < len(curve):
-            curve[idx] = (curve[idx][0], value)
-            curves[curve_id] = self._enforce_symmetry(curve, self._get_edge_shape())
-            self.state.edge_curves = curves
-            self.state.push_history(
+            self.state.move_node(
+                curve_id,
+                idx,
+                curve[idx][0] if x is None else x,
+                curve[idx][1] if y is None else y,
                 f"Edit curve {curve_id} control point",
-                coalesce_key=f"curve_point_{curve_id}",
-                coalesce_window_ms=1000,
+                key=f"curve_point_{curve_id}",
+                window=1.0,
             )
 
-    def _add_point(self, event):
-        curve_id = self.state.active_curve_id
-        if curve_id is None:
-            return
-
-        curves = dict(self.state.edge_curves)
-        curve = list(curves.get(curve_id, [(0, 0), (1, 0)]))
-        edge_shape = self._get_edge_shape()
-
-        # Find the best place to add a point (in the editable region)
-        # For S/U curves, only add points with x <= 0.5
-        if len(curve) > 2:
-            # Find the last editable segment
-            insert_before = len(curve) - 1
-            for i in range(len(curve) - 1, 0, -1):
-                if self._is_editable(i, len(curve), edge_shape):
-                    insert_before = i + 1
-                    break
-
-            # For S/U curves, ensure we're adding in the first half
-            if edge_shape in ("S", "U"):
-                # Find a segment in the first half
-                for i in range(len(curve) - 1):
-                    if curve[i][0] < 0.5 and curve[i + 1][0] <= 0.5 + 1e-9:
-                        insert_before = i + 1
-                        break
-                else:
-                    # No segment in first half, insert before midpoint
-                    for i in range(len(curve)):
-                        if curve[i][0] >= 0.5 - 1e-9:
-                            insert_before = i
-                            break
-
-            x_new = (curve[insert_before - 1][0] + curve[insert_before][0]) / 2
-            y_new = (curve[insert_before - 1][1] + curve[insert_before][1]) / 2
-            curve.insert(insert_before, [x_new, y_new])
-        else:
-            curve.insert(1, [0.5, 0.1])
-
-        curves[curve_id] = self._enforce_symmetry(curve, edge_shape)
-        self.state.edge_curves = curves
-
-    def _remove_point_at(self, idx: int):
-        curve_id = self.state.active_curve_id
-        if curve_id is None:
-            return
-
-        curves = dict(self.state.edge_curves)
-        curve = list(curves.get(curve_id, [(0, 0), (1, 0)]))
-
-        if len(curve) > 2:
-            edge_shape = self._get_edge_shape()
-            if self._is_editable(idx, len(curve), edge_shape):
-                curve.pop(idx)
-                # Enforce symmetry to update mirrored points
-                curve = self._enforce_symmetry(curve, edge_shape)
-                curves[curve_id] = curve
-                self.state.edge_curves = curves
-
-    def _remove_point(self, event):
-        curve_id = self.state.active_curve_id
-        if curve_id is None:
-            return
-
-        curves = dict(self.state.edge_curves)
-        curve = list(curves.get(curve_id, [(0, 0), (1, 0)]))
-        edge_shape = self._get_edge_shape()
-
-        if len(curve) > 2:
-            last_editable = None
-            for i in range(len(curve) - 2, 0, -1):
-                if self._is_editable(i, len(curve), edge_shape):
-                    last_editable = i
-                    break
-            if last_editable is not None:
-                curve.pop(last_editable)
-                # Enforce symmetry to update mirrored points
-                curve = self._enforce_symmetry(curve, edge_shape)
-                curves[curve_id] = curve
-                self.state.edge_curves = curves
-
-    def _copy_from_curve(self, src_curve_id: str):
+    def _copy_from_curve(self, src_curve_id: int):
         """Copy nodes from src_curve_id to the active curve, enforcing destination symmetry."""
-        from tactile import EdgeShape
-
-        from isohedral_tiling_ui.utils.symmetry import enforce_curve_symmetry
-
         curve_id = self.state.active_curve_id
         if curve_id is None or src_curve_id is None:
             return
-
-        src_pts = list(self.state.edge_curves.get(src_curve_id) or [(0, 0), (1, 0)])
-
-        dst_shape_type = self._get_edge_shape()
-        sm = {"J": EdgeShape.J, "S": EdgeShape.S, "U": EdgeShape.U, "I": EdgeShape.I}
-        if dst_shape_type in sm:
-            src_pts = enforce_curve_symmetry(src_pts, sm[dst_shape_type])
-
-        curves = dict(self.state.edge_curves)
-        curves[curve_id] = src_pts
-        self.state.edge_curves = curves
-        self.state.push_history(f"Copy curve {src_curve_id} → {curve_id}", force_new=True)
-
-    def _get_edge_shape(self) -> str:
-        info = self.state._type_info
-        if info is None:
-            return "J"
-        curve_id = self.state.active_curve_id
-        return next((e["shape_type"] for e in info["edges"] if e["shape_id"] == curve_id), "J")
+        self.state.copy_curve(src_curve_id, curve_id)

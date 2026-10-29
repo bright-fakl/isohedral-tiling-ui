@@ -6,6 +6,12 @@ import math
 
 import panel as pn
 import param
+from isotile import find_types, get_type, list_presets
+
+from isohedral_tiling_ui.components.icon_button import icon_button
+
+NORMAL = {"border": "1px solid #eee", "background": "transparent"}
+SELECTED = {"border": "2px solid #1971c2", "background": "#e7f1fb"}
 
 
 class TileTypeSelector(pn.viewable.Viewer):
@@ -20,18 +26,18 @@ class TileTypeSelector(pn.viewable.Viewer):
     def __init__(self, **params):
         super().__init__(**params)
         self._grid = pn.GridBox(ncols=6, nrows=0)
+        self._buttons: dict[int, pn.widgets.Button] = {}
         self._build_grid()
+        self.state.param.watch(self._mark_selected, ["tiling_type", "source_label"])
 
     @param.depends("filter_vertices", "filter_params", "filter_customizable", watch=True)
     def _build_grid(self):
         """Rebuild the type grid when filters change."""
-        from carto_flow.symbol_cartogram.tiling import IsohedralTiling
-
         v = int(self.filter_vertices) if self.filter_vertices != "All" else None
         p = int(self.filter_params) if self.filter_params != "All" else None
         has_cust = self.filter_customizable or None
 
-        types = IsohedralTiling.find_types(
+        types = find_types(
             num_vertices=v,
             num_parameters=p,
             has_customizable_edges=has_cust,
@@ -41,13 +47,18 @@ class TileTypeSelector(pn.viewable.Viewer):
         if self.state.tiling_type not in types:
             types = [self.state.tiling_type, *types]
 
-        buttons = []
-        for t in sorted(set(types)):
-            info = IsohedralTiling.type_info(t)
-            btn = self._create_type_button(t, info)
-            buttons.append(btn)
+        self._buttons = {t: self._create_type_button(t, get_type(t).info()) for t in sorted(set(types))}
+        self._mark_selected()
+        self._grid.objects = list(self._buttons.values())
 
-        self._grid.objects = buttons
+    def _mark_selected(self, *events):
+        """Highlight the button of the current type unless the design is a gallery preset (the gallery shows that)."""
+        if self.state.tiling_type not in self._buttons:
+            self._build_grid()  # the filters hide the current type; the grid keeps it
+            return
+        from_gallery = self.state.source_label in list_presets()
+        for number, button in self._buttons.items():
+            button.styles = SELECTED if number == self.state.tiling_type and not from_gallery else NORMAL
 
     def _create_type_button(self, tiling_type: int, info: dict) -> pn.widgets.Button:
         """Create a clickable SVG button for a tiling type."""
@@ -79,78 +90,24 @@ class TileTypeSelector(pn.viewable.Viewer):
         tooltip_text = f"IH{tiling_type}: {num_vertices} vertices, {num_params} params, {num_aspects} aspects, {len(customizable)} editable edges"
 
         # Create a button with the SVG as its content - smaller and tighter
-        btn = pn.widgets.ButtonIcon(
-            icon=svg,
+        btn = icon_button(
+            svg,
+            28,
+            lambda e, t=tiling_type: self._on_type_select(t),
             width=30,
             height=30,
-            margin=0,  # (1, 1, 1, 1),  # Tight spacing
+            margin=0,
             description=tooltip_text,  # Tooltip on hover
-            on_click=lambda e, t=tiling_type: self._on_type_select(t),
-            styles={"border": "1px solid #eee"},
+            styles=NORMAL,
             align="center",
+            tags=[f"type:{tiling_type}"],
         )
 
-        # btn.stylesheets = [f"""
-        #     button.bk-btn {{
-        #         border: {border} !important;
-        #         border-radius: 4px !important;
-        #     }}
-        # """]
-
-        # btn = pn.widgets.Button(
-        #     name="",
-        #     width=30,
-        #     height=30,
-        #     margin=(1, 1, 1, 1),  # Tight spacing
-        #     description=tooltip_text,  # Tooltip on hover
-        #     on_click=lambda e, t=tiling_type: self._on_type_select(t),
-        # )
-
-        # # Embed SVG as background image using data URI - only use stylesheets, not styles
-        # import base64
-        # svg_bytes = svg.encode('utf-8')
-        # svg_b64 = base64.b64encode(svg_bytes).decode('utf-8')
-        # btn.stylesheets = [f"""
-        #     button.bk-btn {{
-        #         background-image: url("data:image/svg+xml;base64,{svg_b64}") !important;
-        #         background-repeat: no-repeat !important;
-        #         background-position: center !important;
-        #         background-size: 24px 24px !important;
-        #         background-color: {bg} !important;
-        #         border: {border} !important;
-        #         border-radius: 4px !important;
-        #         width: 30px !important;
-        #         height: 30px !important;
-        #         padding: 2px !important;
-        #     }}
-        # """]
         return btn
 
     def _on_type_select(self, tiling_type: int):
-        """Handle tiling type selection."""
-        from carto_flow.symbol_cartogram.tiling import IsohedralTiling
-
-        # Create new tiling and update all state at once
-        tiling = IsohedralTiling(tiling_type)
-
-        # Use batch update to avoid multiple preview regenerations
-        with self.state.batch_update():
-            # Update parameters BEFORE tiling_type to avoid triggering _update_tiling with wrong params
-            # First set parameters, then tiling_type
-            old_params = list(tiling._ih.parameters)
-            self.state.parameters = old_params
-            self.state.tiling_type = tiling_type
-            self.state.edge_curves = {}
-            self.state.edge_curve_modes = {}
-            self.state.current_preset = ""
-            # Save initial state
-            self.state.set_initial_state(tiling)
-
-        self.state.parameters_version += 1
-        # Clear history and make new tile type the first entry
-        self.state._history = [self.state._snapshot()]
-        self.state._history_idx = 0
-        print(f"DEBUG: History cleared and tile_type:IH{tiling_type} → index 0 (length: 1)")
+        """Handle tiling type selection: the type at its defaults, a new baseline and a new history."""
+        self.state.load_type(tiling_type)
 
     def __panel__(self):
         return pn.Card(

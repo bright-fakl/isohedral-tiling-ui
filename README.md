@@ -10,7 +10,7 @@ license: mit
 
 # isohedral-tiling-ui
 
-Interactive Panel/Bokeh UI for designing isohedral tilings, powered by [carto-flow](https://github.com/bright-fakl/carto-flow).
+Interactive Panel/Bokeh UI for designing isohedral tilings, powered by [isotile](https://github.com/bright-fakl/isotile).
 
 **Try it out:** https://devfakl-isohedral-tiling-ui.hf.space/
 
@@ -25,5 +25,6 @@ Or from Python:
 
 ```python
 from isohedral_tiling_ui import launch_ui
+
 launch_ui(port=5006)
 ```

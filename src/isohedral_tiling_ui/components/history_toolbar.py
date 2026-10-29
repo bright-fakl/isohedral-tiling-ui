@@ -11,44 +11,16 @@ class HistoryToolbar(pn.viewable.Viewer):
 
     state = param.ClassSelector(class_=param.Parameterized)
 
-    @param.depends(
-        "state._history_idx",
-        "state._history",
-        "state.reset_available",
-        "state._initial_prototile_svg",
-        "state._initial_preset_name",
-        "state.tiling_type",
-        "state._type_info",
-    )
+    @param.depends("state.history_rev")
     def __panel__(self):
-        idx = self.state._history_idx
-        history = self.state._history
-
-        # Guard against transient inconsistency: _history and _history_idx are
-        # set on separate lines in load_preset, so a watcher can fire between
-        # them with a stale idx pointing past the (just-truncated) list.
-        if idx < 0 or idx >= len(history):
-            can_undo = False
-            can_redo = False
-            undo_desc = ""
-            redo_desc = ""
-        else:
-            can_undo = idx > 0
-            can_redo = idx < len(history) - 1
-            undo_desc = history[idx].get("description", "") if can_undo else ""
-            redo_desc = history[idx + 1].get("description", "") if can_redo else ""
-
-        n_undo = max(0, idx) if idx >= 0 else 0
-        n_redo = max(0, len(history) - idx - 1) if idx >= 0 else 0
+        model = self.state.model
+        can_undo, can_redo = model.can_undo, model.can_redo
+        undo_desc, redo_desc = model.undo_label, model.redo_label
+        n_undo, n_redo = model.n_undo, model.n_redo
 
         # --- Reference tile panel ---
-        preset_label = (
-            self.state._initial_preset_name.replace("_", " ").title()
-            if self.state._initial_preset_name
-            else f"IH{self.state.tiling_type}"
-        )
-
-        type_info = self.state._type_info
+        preset_label = self.state.baseline_label
+        type_info = self.state.type_info
         info_line1 = f"IH{self.state.tiling_type}"
         info_line2 = ""
         if type_info:
@@ -90,14 +62,14 @@ class HistoryToolbar(pn.viewable.Viewer):
             ),
             pn.widgets.Button(
                 name="Reset",
-                on_click=lambda e: self.state.reset_parameters(),
+                on_click=lambda e: self.state.reset(),
                 disabled=not self.state.reset_available,
                 width=110,
             ),
             margin=0,
         )
 
-        if self.state._initial_prototile_svg:
+        if self.state.baseline_svg:
             info_html = (
                 f"<div style='font-size:11px;color:#444;line-height:1.5;white-space:nowrap'>"
                 f"<b>{preset_label}</b><br>"
@@ -108,7 +80,7 @@ class HistoryToolbar(pn.viewable.Viewer):
             return pn.Row(
                 pn.Column(
                     pn.pane.SVG(
-                        self.state._initial_prototile_svg,
+                        self.state.baseline_svg,
                         width=52,
                         height=52,
                     ),
