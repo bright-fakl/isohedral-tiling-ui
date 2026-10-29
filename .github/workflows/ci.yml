@@ -31,7 +31,6 @@ jobs:
   typecheck:
     name: mypy (advisory)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -42,7 +41,7 @@ jobs:
           uv venv --python 3.12
           uv pip install -e . --group dev -c ci/constraints.txt
       - name: mypy (the existing findings do not block)
-        run: uv run --no-sync mypy
+        run: uv run --no-sync mypy || echo "::warning::mypy reports findings (advisory; baseline 495 errors in 11 files)"
 
   tests:
     name: tests (Python ${{ matrix.python-version }})
