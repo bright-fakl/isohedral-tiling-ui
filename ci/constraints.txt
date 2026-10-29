@@ -1,0 +1,5 @@
+# Versions that wrote the golden fixtures in tests/data (tests/make_golden.py). The CI installs with these constraints.
+# pyproject.toml is unchanged, so the Hugging Face Space still resolves its own versions.
+carto-flow==2.0.0
+tactile==0.1.0
+ruff==0.17.3

@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+env:
+  MPLBACKEND: Agg
+
+jobs:
+  lint:
+    name: lint (baseline)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.17"
+      - name: Install ruff
+        run: uv tool install ruff==0.17.3
+      - name: Ruff and ruff format against the recorded baseline
+        run: ci/lint_baseline.sh
+      - name: Ruff on the tests (no findings allowed)
+        run: |
+          ruff check --no-fix tests
+          ruff format --check tests
+
+  typecheck:
+    name: mypy (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.17"
+      - name: Install
+        run: |
+          uv venv --python 3.12
+          uv pip install -e . --group dev -c ci/constraints.txt
+      - name: mypy (the existing findings do not block)
+        run: uv run --no-sync mypy
+
+  tests:
+    name: tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.17"
+      - name: Install
+        run: |
+          uv venv --python ${{ matrix.python-version }}
+          uv pip install -e . --group dev -c ci/constraints.txt
+      - name: pytest
+        run: uv run --no-sync pytest -q
