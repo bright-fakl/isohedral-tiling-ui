@@ -344,6 +344,120 @@ def test_mode_radio_changes_the_mode(state):
     assert state.tiling.edge_curve_modes[1] == "spline"
 
 
+def click(button) -> None:
+    """Click a widget the way the browser does: the ``clicks`` counter of the Bokeh model increases."""
+    button.clicks += 1
+
+
+def test_preset_buttons_are_disabled_with_a_reason_where_the_preset_cannot_apply(state):
+    editor = CurveEditor(state=state)
+    state.load_type(36)
+    buttons = editor._preset_buttons
+    assert buttons["scalloped"].disabled is False
+    assert buttons["scalloped_deep"].disabled is True
+    assert "Not available: the prototile would be invalid" in buttons["scalloped_deep"].description
+    assert buttons["straight"].disabled is True  # already the current curve
+    assert "Not available" not in buttons["scalloped"].description
+
+
+def test_preset_buttons_follow_the_draft(state):
+    editor = CurveEditor(state=state)
+    state.load_type(36)
+    click(editor._preset_buttons["scalloped"])
+    assert editor._preset_buttons["scalloped"].disabled  # now the current curve
+    assert not editor._preset_buttons["straight"].disabled
+    state.undo()
+    assert not editor._preset_buttons["scalloped"].disabled
+    assert editor._preset_buttons["straight"].disabled
+
+
+def test_repeated_preset_clicks_keep_responding(state, notes):
+    editor = CurveEditor(state=state)
+    state.load_type(36)
+    buttons = editor._preset_buttons
+    click(buttons["scalloped"])
+    assert len(state.model.labels) == 2
+    click(buttons["scalloped"])  # the same preset again: nothing to do, no error
+    assert len(state.model.labels) == 2
+    click(buttons["scalloped_down"])  # another one
+    assert len(state.model.labels) == 3
+    # A preset that is refused (the widget is enabled when the state changed after the last refresh) is reported and
+    # the next click works.
+    buttons["scalloped_deep"].disabled = False
+    click(buttons["scalloped_deep"])
+    assert notes.levels() == ["error"]
+    assert "[0, 1]" in notes.events[0][1]
+    assert state.draft.curve(0) == state.draft.curve(0)
+    click(buttons["scalloped"])
+    assert len(state.model.labels) == 4
+    click(buttons["scalloped_down"])
+    assert len(state.model.labels) == 5
+
+
+def test_table_edit_is_applied_through_a_scheduled_callback(state, monkeypatch):
+    """Panel calls on_edit outside the document lock; changing Bokeh models there fails, so the edit is scheduled."""
+    import panel as pn
+    from panel.models.tabulator import TableEditEvent
+
+    editor = CurveEditor(state=state)
+    state.load_preset("wavy_triangle")
+    table = editor._build_point_inputs()[1]
+    scheduled = []
+
+    def execute(callback, schedule="auto"):
+        if schedule is False:  # Panel's own call of on_edit, outside the lock
+            callback()
+        else:
+            scheduled.append((callback, schedule))
+
+    monkeypatch.setattr(pn.state, "execute", execute)
+    before = state.draft
+    table._process_event(TableEditEvent(None, "Y", 1, 0.3, 0.15))  # what the browser sends
+    column = table.value["Y"].tolist()
+    column[1] = 0.3
+    table._update_column("Y", column)  # the patch of the cell, which fires on_edit
+    assert len(scheduled) == 1
+    assert scheduled[0][1] is True
+    assert state.draft is before  # nothing happened outside the scheduled callback
+    scheduled[0][0]()
+    assert state.draft.curve(state.active_curve_id)[1][1] == pytest.approx(0.3)
+    assert state.model.labels[-1] == f"Edit curve {state.active_curve_id} control point"
+
+
+def selected_types(selector: TileTypeSelector) -> list[int]:
+    return [n for n, b in selector._buttons.items() if b.styles.get("border", "").startswith("2px")]
+
+
+def test_exactly_the_current_type_is_marked_whichever_way_it_was_selected(state):
+    selector = TileTypeSelector(state=state)
+    assert selected_types(selector) == [10]
+    selector._buttons[41].clicks += 1  # a click on the button
+    assert state.tiling_type == 41
+    assert selected_types(selector) == [41]
+    state.load_preset("tree")  # the gallery
+    assert selected_types(selector) == [4]
+    state.load_data({"tiling_type": 84})  # a file
+    assert selected_types(selector) == [84]
+    state.set_parameters([0.4, 0.4])
+    state.undo()
+    state.redo()
+    state.reset()
+    assert selected_types(selector) == [84]
+    state.load_type(93)
+    assert selected_types(selector) == [93]
+    selector.filter_vertices = "4"  # the grid is rebuilt; the current type stays in it and marked
+    assert selected_types(selector) == [93]
+    assert all(b.styles["background"] == "transparent" for n, b in selector._buttons.items() if n != 93)
+
+
+def test_buttons_show_no_check_mark_after_a_click(state):
+    """The default active icon of a ButtonIcon is a check mark that stays; the buttons use their own icon."""
+    selector, gallery, curves = TileTypeSelector(state=state), GalleryPanel(state=state), CurveEditor(state=state)
+    buttons = [*selector._buttons.values(), *gallery._grid.objects, *curves._preset_buttons.values()]
+    assert len(buttons) > 100
+    assert all(b.active_icon == b.icon for b in buttons)
+
+
 def test_history_toolbar_follows_the_model(state):
     toolbar = HistoryToolbar(state=state)
     state.load_preset("square")

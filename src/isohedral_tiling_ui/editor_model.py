@@ -33,6 +33,8 @@ from isotile import (
     get_type,
 )
 
+from isohedral_tiling_ui.utils.curve_presets import get_curve_preset, list_curve_presets
+
 Point = tuple[float, float]
 Curve = tuple[Point, ...]
 
@@ -343,6 +345,30 @@ def editable(shape: str, n_nodes: int, i: int) -> bool:
     if abs(i - half) < 1e-9:
         return shape == "U"
     return i < half
+
+
+def preset_availability(draft: Draft, shape_id: int) -> dict[str, str]:
+    """Which curve presets can be applied to a shape id of the draft.
+
+    Maps each preset name to ``""`` if applying it (with the symmetry of the edge shape, in the current mode, with the
+    other curves and parameters as they are) gives a valid prototile that differs from the current one, else to the
+    reason: the curve is already the current one, or the message of ``check_prototile``.
+    """
+    return dict(_preset_availability(draft, shape_id))
+
+
+@lru_cache(maxsize=128)
+def _preset_availability(draft: Draft, shape_id: int) -> tuple[tuple[str, str], ...]:
+    shape = shape_of(draft.type_number, shape_id)
+    out = []
+    for name in list_curve_presets():
+        applied = draft.with_curve(shape_id, enforce_symmetry(get_curve_preset(name), shape))
+        if applied == draft:
+            out.append((name, "already the current curve"))
+            continue
+        report = applied.report()
+        out.append((name, "" if report.valid else f"the prototile would be invalid: {report.message}"))
+    return tuple(out)
 
 
 # ----------------------------------------------------------------------------------------------------------------------

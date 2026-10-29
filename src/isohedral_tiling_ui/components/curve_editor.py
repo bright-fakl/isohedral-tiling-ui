@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import panel as pn
 import param
 from bokeh.events import DoubleTap
@@ -9,7 +11,7 @@ from bokeh.models import ColumnDataSource, CustomJS
 from bokeh.plotting import figure
 from isotile import interpolate
 
-from isohedral_tiling_ui.editor_model import editable
+from isohedral_tiling_ui.editor_model import editable, preset_availability
 from isohedral_tiling_ui.utils.curve_presets import get_curve_preset, list_curve_presets
 
 
@@ -31,10 +33,13 @@ class CurveEditor(pn.viewable.Viewer):
         self._updating_from_state = False  # Flag to prevent circular updates
         self._programmatic_cp_update = False  # Flag to skip history push on programmatic cp_source writes
         self._y_scale = 1.0  # Y-axis scale factor (default ±1)
+        self._preset_buttons: dict[str, pn.widgets.ButtonIcon] = {}
+        self._preset_grid = self._build_preset_buttons()
         self._figure = self._build_figure()
         self._setup_callbacks()
         # Initialize with current state values since @param.depends doesn't fire on init
         self._update_figure()
+        self._refresh_presets()
 
     def _build_figure(self):
         """Build the Bokeh curve editor figure."""
@@ -505,7 +510,7 @@ class CurveEditor(pn.viewable.Viewer):
             self._build_curve_selector_row,
             pn.Row(
                 pn.pane.Bokeh(self._figure, height=210, sizing_mode="stretch_width"),
-                self._build_preset_buttons(),
+                self._preset_grid,
                 sizing_mode="stretch_width",
             ),
             self._build_point_inputs,  # Pass as callable for reactivity
@@ -680,48 +685,42 @@ class CurveEditor(pn.viewable.Viewer):
             "ramp_down": "Flat then ramp down",
         }
 
+        self._preset_descriptions: dict[str, str] = {}
         presets = list_curve_presets()
         buttons = []
 
         for name in presets:
             svg = self._create_preset_icon(name)
-            # svg_b64 = base64.b64encode(svg.encode('utf-8')).decode('utf-8')
-
             # Get description for tooltip
             desc = preset_descriptions.get(name, name.replace("_", " ").title())
 
             btn = pn.widgets.ButtonIcon(
                 icon=svg,
+                active_icon=svg,  # the default active icon is a check mark that stays after a click
                 description=desc,
                 on_click=lambda e, n=name: self._apply_preset(n),
                 size="24px",
             )
+            self._preset_buttons[name] = btn
+            self._preset_descriptions[name] = desc
 
-            # btn = pn.widgets.Button(
-            #     name="",
-            #     width=24, height=30, min_width=20,
-            #     margin=(1, 1, 1, 1),
-            #     description=desc,  # Tooltip on hover
-            #     on_click=lambda e, n=name: self._apply_preset(n),
-            #     sizing_mode="fixed"
-            # )
-            # btn.stylesheets = [f"""
-            #     button.bk-btn {{
-            #         background-image: url("data:image/svg+xml;base64,{svg_b64}") !important;
-            #         background-repeat: no-repeat !important;
-            #         background-position: center !important;
-            #         background-size: 24px 24px !important;
-            #         background-color: white !important;
-            #         border: 1px solid #ccc !important;
-            #         border-radius: 4px !important;
-            #         width: 24px !important;
-            #         height: 24px !important;
-            #         padding: 2px !important;
-            #     }}
-            # """]
             buttons.append(btn)
 
         return pn.GridBox(*buttons, ncols=3, sizing_mode="fixed", width=100)
+
+    @param.depends("state.draft", "state.active_curve_id", watch=True)
+    def _refresh_presets(self):
+        """Disable the presets that cannot be applied to the selected curve and say why in the tooltip."""
+        curve_id = self.state.active_curve_id
+        if not self._preset_buttons or curve_id is None:
+            return
+        status = preset_availability(self.state.draft, curve_id)
+        for name, button in self._preset_buttons.items():
+            reason = status[name]
+            description = self._preset_descriptions[name]
+            button.disabled = bool(reason)
+            button.description = f"{description}. Not available: {reason}" if reason else description
+            button.styles = {"opacity": "0.35"} if reason else {}
 
     @param.depends("state.draft", "state.active_curve_id", watch=False)
     def _build_point_inputs(self):
@@ -806,9 +805,14 @@ class CurveEditor(pn.viewable.Viewer):
             col = event.column
             value = event.value
             if col == "X":
-                self._on_x_change(idx, value)
+                handler = partial(self._on_x_change, idx, value)
             elif col == "Y":
-                self._on_y_change(idx, value)
+                handler = partial(self._on_y_change, idx, value)
+            else:
+                return
+            # Panel calls on_edit outside the document lock, and the edit changes Bokeh models (the figures):
+            # run it as a scheduled callback.
+            pn.state.execute(handler, schedule=True)
 
         table.on_edit(on_edit)
 

@@ -8,6 +8,9 @@ import panel as pn
 import param
 from isotile import find_types, get_type
 
+NORMAL = {"border": "1px solid #eee", "background": "transparent"}
+SELECTED = {"border": "2px solid #1971c2", "background": "#e7f1fb"}
+
 
 class TileTypeSelector(pn.viewable.Viewer):
     """Filterable grid of tiling type buttons with colored shapes."""
@@ -21,7 +24,9 @@ class TileTypeSelector(pn.viewable.Viewer):
     def __init__(self, **params):
         super().__init__(**params)
         self._grid = pn.GridBox(ncols=6, nrows=0)
+        self._buttons: dict[int, pn.widgets.ButtonIcon] = {}
         self._build_grid()
+        self.state.param.watch(self._mark_selected, "tiling_type")
 
     @param.depends("filter_vertices", "filter_params", "filter_customizable", watch=True)
     def _build_grid(self):
@@ -40,13 +45,17 @@ class TileTypeSelector(pn.viewable.Viewer):
         if self.state.tiling_type not in types:
             types = [self.state.tiling_type, *types]
 
-        buttons = []
-        for t in sorted(set(types)):
-            info = get_type(t).info()
-            btn = self._create_type_button(t, info)
-            buttons.append(btn)
+        self._buttons = {t: self._create_type_button(t, get_type(t).info()) for t in sorted(set(types))}
+        self._mark_selected()
+        self._grid.objects = list(self._buttons.values())
 
-        self._grid.objects = buttons
+    def _mark_selected(self, *events):
+        """Highlight the button of the current type and no other, whichever way the type was selected."""
+        if self.state.tiling_type not in self._buttons:
+            self._build_grid()  # the filters hide the current type; the grid keeps it
+            return
+        for number, button in self._buttons.items():
+            button.styles = SELECTED if number == self.state.tiling_type else NORMAL
 
     def _create_type_button(self, tiling_type: int, info: dict) -> pn.widgets.Button:
         """Create a clickable SVG button for a tiling type."""
@@ -80,12 +89,13 @@ class TileTypeSelector(pn.viewable.Viewer):
         # Create a button with the SVG as its content - smaller and tighter
         btn = pn.widgets.ButtonIcon(
             icon=svg,
+            active_icon=svg,  # the default active icon is a check mark that stays after a click
             width=30,
             height=30,
             margin=0,  # (1, 1, 1, 1),  # Tight spacing
             description=tooltip_text,  # Tooltip on hover
             on_click=lambda e, t=tiling_type: self._on_type_select(t),
-            styles={"border": "1px solid #eee"},
+            styles=NORMAL,
             align="center",
         )
 

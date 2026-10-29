@@ -425,3 +425,40 @@ def test_type_info_is_cached_and_complete():
     info = em.type_info(41)
     for key in ("num_vertices", "num_aspects", "num_parameters", "customizable_shape_ids", "parameters", "edges"):
         assert key in info
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Curve preset availability
+
+
+def test_preset_availability_names_the_reason():
+    draft = Draft.of(36)  # a J curve on shape id 0: the deep scallops cross the neighbors
+    status = em.preset_availability(draft, 0)
+    assert list(status) == list(em.list_curve_presets())
+    assert status["scalloped"] == ""
+    assert status["scalloped_deep"].startswith("the prototile would be invalid")
+    assert "[0, 1]" in status["scalloped_deep"]
+    assert status["straight"] == "already the current curve"
+
+
+def test_preset_availability_follows_the_current_curve_and_mode():
+    draft = Draft.of(36).with_curve(0, em.enforce_symmetry(em.get_curve_preset("scalloped"), "J"))
+    status = em.preset_availability(draft, 0)
+    assert status["scalloped"] == "already the current curve"
+    assert status["straight"] == ""
+    assert em.preset_availability(draft, 0) == status  # cached, same result
+
+
+@pytest.mark.parametrize("number", [n for n in tiling_types() if "I" not in get_type(n).shape_types or n % 3 == 0])
+def test_preset_availability_agrees_with_committing_the_preset(number):
+    t = get_type(number)
+    for sid, shape in enumerate(t.shape_types):
+        if shape == "I":
+            continue
+        draft = Draft.of(number)
+        for name, reason in em.preset_availability(draft, sid).items():
+            m = EditorModel(draft)
+            curve = em.enforce_symmetry(em.get_curve_preset(name), shape)
+            result = m.commit("x", draft.with_curve(sid, curve))
+            changed = m.draft != draft
+            assert (reason == "") == (result.committed and changed), (number, sid, name, reason)

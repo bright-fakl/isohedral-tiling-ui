@@ -33,6 +33,7 @@ class GalleryPanel(pn.viewable.Viewer):
 
             btn = pn.widgets.ButtonIcon(
                 icon=svg,
+                active_icon=svg,  # the default active icon is a check mark that stays after a click
                 width=40,
                 height=40,
                 margin=(1, 1, 1, 1),  # Tight spacing
