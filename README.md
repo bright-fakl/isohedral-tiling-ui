@@ -44,4 +44,4 @@ Pull requests are checked by the Docker build and smoke-test job; there is no st
 
 The live Space (`devfakl/isohedral-tiling-ui`) is fed a single snapshot commit (without `tests/` and `ci/`) on every push to `main`, after all of those jobs pass. The job then waits until the Space runs that commit and answers HTTP 200, and fails with the Space's stage (for example `BUILD_ERROR`) otherwise. To redeploy or roll back, run the CI workflow manually on `main` and give a commit of `main` as `ref`; a manual run skips the CI gate for that ref.
 
-A weekly job runs the tests against isotile `main` instead of the pinned commit and only reports.
+A weekly job runs the tests against isotile `main` instead of the PyPI release and only reports.

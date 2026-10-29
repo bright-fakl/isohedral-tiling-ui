@@ -1,6 +1,6 @@
 name: Weekly isotile main
 
-# Runs the tests against the head of isotile main instead of the pinned commit, to find API changes before the pin moves.
+# Runs the tests against the head of isotile main instead of the isotile release from PyPI, to find API changes before the next release.
 # It only reports: a failure does not block or deploy anything.
 on:
   schedule:
@@ -20,7 +20,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           version: "0.8.17"
-      - name: Install with isotile main in place of the pin
+      - name: Install, then replace the PyPI isotile with main
         run: |
           uv venv --python 3.12
           uv pip install -e . --group dev -c ci/constraints.txt
