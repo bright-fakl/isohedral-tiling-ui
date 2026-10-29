@@ -1,0 +1,14 @@
+{
+  "version": "1.0",
+  "tiling_type": 41,
+  "parameters": [
+    0.230769230769,
+    0.5
+  ],
+  "edge_curves": {},
+  "edge_curve_modes": {},
+  "description": "square",
+  "metadata": {
+    "created": "2026-01-01T00:00:00+00:00"
+  }
+}
