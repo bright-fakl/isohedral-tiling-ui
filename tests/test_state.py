@@ -365,7 +365,7 @@ def test_preset_buttons_are_unavailable_with_a_reason_where_the_preset_cannot_ap
     assert "already the current curve" in buttons["straight"].description
     assert "Not available" not in buttons["scalloped"].description
     assert buttons["scalloped_deep"].styles == {"opacity": "0.35"}
-    assert buttons["scalloped"].styles == {}
+    assert buttons["scalloped"].styles == {"opacity": "1"}
 
 
 def test_icon_buttons_are_not_button_icons(state):
@@ -417,23 +417,34 @@ def test_preset_curves_have_the_symmetry_of_the_edge(shape):
 
 
 def test_preset_curves_for_s_and_u_edges():
-    # the first half of the preset is used; a preset whose first half is straight gives the symmetric part
+    # a preset that has the symmetry of the shape is unchanged
     assert preset_curve("scalloped", "U") == pytest.approx(np.array(get_curve_preset("scalloped")))
-    assert preset_curve("scalloped", "S")[1] == pytest.approx([0.25, 0.08])
-    ramp = preset_curve("ramp_up", "S")
-    assert ramp[1] == pytest.approx([0.3, -0.06]) and ramp[2] == pytest.approx([0.7, 0.06])  # not flat
+    assert preset_curve("s_curve", "S") == pytest.approx(np.array(get_curve_preset("s_curve")))
+    # S: the whole preset in the first half, rotated for the second: 2 n - 1 points, through the center
+    for name in ("scalloped", "ramp_up", "arrow", "puzzle"):
+        preset = np.array(get_curve_preset(name))
+        curve = preset_curve(name, "S")
+        n = len(preset)
+        assert len(curve) == 2 * n - 1
+        assert curve[:n] == pytest.approx(preset * [0.5, 1.0])
+        assert curve[n - 1] == pytest.approx([0.5, 0.0])
+        assert np.abs(curve[:, 1]).max() > 0.05  # no preset is flat
+    # U: the first half of the points; the symmetric part if that is straight
+    assert preset_curve("scalloped", "U") == pytest.approx(np.array(get_curve_preset("scalloped")))
+    assert preset_curve("hook_right", "U")[1] == pytest.approx(get_curve_preset("hook_right")[1])
     assert preset_curve("ramp_up", "U")[1, 1] == pytest.approx(0.06)
-    # nothing for the shape to hold: straight, and reported as unavailable
-    assert np.abs(preset_curve("arrow", "S")[:, 1]).max() == 0
 
 
-def test_presets_without_a_part_that_the_edge_can_hold_are_unavailable(state):
+def test_presets_apply_to_s_and_u_edges(state):
     editor = CurveEditor(state=state)
     state.load_type(4)  # edge 0 is an S edge
     assert state.shape_type(0) == "S"
-    assert {"arrow", "arrow_down"} <= unavailable(editor)
-    assert "symmetry of the S edge" in editor._preset_buttons["arrow"].description
-    assert "ramp_up" not in unavailable(editor)
+    for name in ("ramp_up", "arrow", "arrow_down", "hook_right"):
+        assert name not in unavailable(editor)
+    click(editor._preset_buttons["ramp_up"])
+    assert any(y != 0 for _, y in state.draft.curve(0))
+    state.load_type(12)  # edge 0 is a U edge
+    assert state.shape_type(0) == "U"
     click(editor._preset_buttons["ramp_up"])
     assert any(y != 0 for _, y in state.draft.curve(0))
 

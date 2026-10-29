@@ -351,21 +351,32 @@ def editable(shape: str, n_nodes: int, i: int) -> bool:
 def preset_curve(name: str, shape: str) -> np.ndarray:
     """The control points of a curve preset for an edge shape.
 
-    A preset is defined over the whole edge. ``J`` takes it unchanged. For ``S`` and ``U`` the edge holds the first
-    half of the points and the second half follows from the symmetry (``enforce_symmetry``: ``S`` rotation by 180
-    degrees about ``(0.5, 0)``, ``U`` mirror ``x = 0.5``), so the first half of the preset is used. If that gives a
-    straight edge for a preset that is not straight (the shape of the preset is in its second half, as for ``ramp_up``),
-    each point is averaged with the image of the point at the mirrored index under the symmetry of the shape: the
-    symmetric part of the preset. If that is straight as well, the preset has nothing that the shape can hold and
-    the result is straight (``preset_availability`` reports the preset as unavailable).
+    A preset is defined over the whole edge and ends at ``(1, 0)``. ``J`` takes it unchanged, and so do ``S`` and ``U``
+    if the preset already has the symmetry of the shape.
+
+    ``S`` (rotation by 180 degrees about ``(0.5, 0)``): the whole preset is compressed into the first half of the
+    edge (``x`` to ``x / 2``, ``y`` kept) and the second half is its rotated image. The preset ends at ``y = 0``, so
+    the curve passes through the center. The edge gets ``2 n - 1`` points for a preset of ``n`` points.
+
+    ``U`` (mirror ``x = 0.5``): the first half of the points of the preset, completed by the mirror image
+    (``enforce_symmetry``). Compressing the whole preset would give a notch at the mirror line. If the first half is
+    straight for a preset that is not (``ramp_up``), each point is averaged with the image of the point at the
+    mirrored index: the symmetric part of the preset.
     """
     p = np.array(get_curve_preset(name), dtype=float)
+    if shape not in ("S", "U") or np.allclose(p, enforce_symmetry(p, shape)):
+        return np.asarray(enforce_symmetry(p, shape))
+    if shape == "S":
+        half = p.copy()
+        half[:, 0] /= 2
+        image = half[-2::-1].copy()
+        image[:, 0] = 1.0 - image[:, 0]
+        image[:, 1] = -image[:, 1]
+        return np.asarray(enforce_symmetry(np.vstack([half, image]), shape))
     out = np.asarray(enforce_symmetry(p, shape))
-    if shape in ("S", "U") and name != "straight" and np.abs(out[:, 1]).max() < 1e-9:
+    if name != "straight" and np.abs(out[:, 1]).max() < 1e-9:
         image = p[::-1].copy()
         image[:, 0] = 1.0 - image[:, 0]
-        if shape == "S":
-            image[:, 1] = -image[:, 1]
         out = np.asarray(enforce_symmetry((p + image) / 2, shape))
     return out
 
@@ -386,10 +397,6 @@ def _preset_availability(draft: Draft, shape_id: int) -> tuple[tuple[str, str], 
     out = []
     for name in list_curve_presets():
         curve = preset_curve(name, shape)
-        if name != "straight" and shape in ("S", "U") and np.abs(curve[:, 1]).max() < 1e-9:
-            kind = "half-turn" if shape == "S" else "mirror"
-            out.append((name, f"the preset has no part with the {kind} symmetry of the {shape} edge"))
-            continue
         applied = draft.with_curve(shape_id, curve)
         if applied == draft:
             out.append((name, "already the current curve"))

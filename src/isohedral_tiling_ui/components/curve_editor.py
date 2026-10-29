@@ -851,7 +851,9 @@ class CurveEditor(pn.viewable.Viewer):
             description = self._preset_descriptions[name]
             self._preset_reasons[name] = reason
             button.description = f"{description}. Not available: {reason}" if reason else description
-            button.styles = {"opacity": "0.35"} if reason else {}
+            button.styles = {
+                "opacity": "0.35" if reason else "1"
+            }  # both set: a removed style is not cleared in a hidden view
 
     @param.depends("state.draft", "state.active_curve_id", watch=False)
     def _build_point_inputs(self):

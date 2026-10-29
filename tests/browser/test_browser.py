@@ -72,11 +72,13 @@ class App:
     # -- models ----------------------------------------------------------------------------------------
 
     def button(self, tag: str) -> str:
-        """Id of the ButtonIcon model with a tag (``preset:<name>``, ``tile:<name>``, ``type:<number>``)."""
-        return self.js(
-            "(t) => [...Bokeh.documents[0].all_models].find(m => m.tags && m.tags.length && m.tags.includes(t)).id",
-            tag,
+        """Id of the button model with a tag (``preset:<name>``, ``tile:<name>``, ``type:<number>``) once it is shown."""
+        find = (
+            "(t) => [...Bokeh.documents[0].all_models].find(m => m.tags && m.tags.includes(t)"
+            " && Bokeh.index.find_one(m))"
         )
+        self.page.wait_for_function(f"(t) => !!({find})(t)", arg=tag)
+        return self.js(f"(t) => ({find})(t).id", tag)
 
     def tagged(self, kind: str) -> dict[str, dict]:
         """Style border and disabled flag of the ButtonIcon models by tag of a kind (``preset``, ``tile``, ``type``)."""
@@ -112,7 +114,7 @@ class App:
         buttons = self.tagged("preset")
         assert len(buttons) == len(list_curve_presets())
         assert not any(b["disabled"] for b in buttons.values()), "the disabled property must not be used"
-        return {n for n, b in buttons.items() if b["styles"].get("opacity")}
+        return {n for n, b in buttons.items() if b["styles"].get("opacity") == "0.35"}
 
     def wait_for(self, read, expected, timeout: float = 8.0) -> None:
         """Wait until ``read()`` returns ``expected``; fail with the last value otherwise."""
@@ -123,6 +125,17 @@ class App:
                 assert value == expected
                 return
             time.sleep(0.2)
+
+    def click_until(self, tag: str, read, expected, tries: int = 3) -> None:
+        """Click a button and wait for its effect; click again if a click was lost while the page was updating."""
+        for attempt in range(tries):
+            self.click_model(self.button(tag))
+            try:
+                self.wait_for(read, expected, timeout=4.0)
+                return
+            except AssertionError:
+                if attempt == tries - 1:
+                    raise
 
     def wait_muted(self, names: set[str]) -> None:
         self.wait_for(self.muted_presets, names)
@@ -220,6 +233,25 @@ class App:
             }""",
             tag,
         )
+
+    def preset_opacities(self) -> dict[str, float]:
+        """Computed opacity of each rendered preset button (a hidden button has no view and is left out)."""
+        return self.js(
+            """() => Object.fromEntries([...Bokeh.documents[0].all_models].filter(
+                m => m.tags && m.tags.some(t => typeof t === 'string' && t.startsWith('preset:'))
+            ).map(m => [m.tags[0].slice(7), Bokeh.index.find_one(m)]).filter(([, v]) => v).map(
+                ([n, v]) => [n, parseFloat(getComputedStyle(v.el).opacity)]))"""
+        )
+
+    def expect_presets_match(self, unavailable: set[str]) -> None:
+        """The computed opacity is below 1 for the unavailable presets and 1 for the others."""
+        names = set(list_curve_presets())
+
+        def read():
+            return {n for n, o in self.preset_opacities().items() if o < 1}
+
+        self.wait_for(read, unavailable)
+        assert set(self.preset_opacities()) == names
 
     def vertex_and_outline(self, k: int) -> tuple[list[float], list[float]]:
         """Position of the k-th movable handle of the prototile editor and of the same vertex in the outline."""
@@ -411,8 +443,7 @@ def test_tiles_and_types_stay_selectable_after_being_selected(app):
     available = [n for n in list_curve_presets() if n not in app.muted_presets()]
     app.click_preset(available[0])  # an edit of the tree
     app.wait_for(app.undo_count, 1)
-    app.click_model(app.button("tile:tree"))
-    app.wait_for(app.undo_count, 0)
+    app.click_until("tile:tree", app.undo_count, 0)
 
 
 def test_a_tile_without_editable_curves_clears_the_curve_editor(app):
@@ -496,3 +527,32 @@ def test_a_dragged_vertex_stays_on_the_vertex_the_parameters_allow(app):
     app.wait_for(app.undo_count, n + 1)
     handle, vertex = app.vertex_and_outline(k)  # after the release
     assert handle == pytest.approx(vertex, abs=1e-6)
+
+
+def test_presets_are_not_muted_after_a_tile_without_curves(app):
+    from isohedral_tiling_ui.editor_model import preset_availability
+    from isohedral_tiling_ui.state import TilingState
+
+    def expected(number=None, preset=None):
+        state = TilingState()
+        state.load_type(number) if number else state.load_preset(preset)
+        cid = state.active_curve_id
+        return {n for n, r in preset_availability(state.draft, cid).items() if r}
+
+    app.click_model(app.button("tile:equilateral_triangle"))
+    app.wait_for(lambda: app.marked("tile"), ["equilateral_triangle"])
+    app.wait_for(lambda: app.curve_editor_state()["shown"], False)
+    app.click_text("Tiling Type")
+    for number in (41, 4, 12, 36):  # J; S and J; U and J; J
+        app.click_model(app.button("tile:equilateral_triangle"))
+        app.wait_for(lambda: app.curve_editor_state()["shown"], False)
+        app.click_model(app.button(f"type:{number}"))
+        app.wait_for(lambda n=str(number): app.marked("type"), [str(number)])
+        app.wait_for(lambda: app.curve_editor_state()["shown"], True)
+        app.expect_presets_match(expected(number))
+    # the other ways back: a tile, undo and redo of a load do not exist (a load starts a new history), so a tile
+    app.click_model(app.button("tile:equilateral_triangle"))
+    app.wait_for(lambda: app.curve_editor_state()["shown"], False)
+    app.click_model(app.button("tile:wavy_triangle"))
+    app.wait_for(lambda: app.curve_editor_state()["shown"], True)
+    app.expect_presets_match(expected(preset="wavy_triangle"))
