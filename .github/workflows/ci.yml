@@ -6,12 +6,16 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit or branch of main to deploy to the live Space (default: the selected ref). Skips the CI gate for that ref."
+        required: false
+        default: ""
 
 env:
   MPLBACKEND: Agg
   # Hugging Face Spaces (Docker SDK). Change the names here only.
   HF_SPACE_LIVE: devfakl/isohedral-tiling-ui
-  HF_SPACE_STAGING: devfakl/isohedral-tiling-ui-staging
 
 jobs:
   lint:
@@ -119,36 +123,16 @@ jobs:
         if: always()
         run: docker rm -f app
 
-  staging-skip:
-    name: staging sync (skipped for forks)
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "::notice::Secrets are not available to pull requests from forks, so the staging Space was not updated."
-
-  staging:
-    name: staging Space sync
-    # Same-repository pull requests only. The staging Space shows the last pull request that was synced.
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-    needs: [lint, tests, browser, docker]
-    runs-on: ubuntu-latest
-    concurrency:
-      group: staging-space
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          lfs: true
-      - name: Push the snapshot to the staging Space
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: ci/sync_space.sh "$HF_SPACE_STAGING" "${{ github.event.pull_request.head.sha }}"
-
   live:
     name: live Space sync
-    # Only after every CI job has passed for this commit.
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    # A push to main deploys only after every CI job has passed for that commit.
+    # A manual run deploys the chosen ref without that gate (a rollback must work while main is red);
+    # the ref must be in the history of main.
+    if: >-
+      always() && github.ref == 'refs/heads/main' && (
+        (github.event_name == 'push' && needs.lint.result == 'success' && needs.tests.result == 'success'
+          && needs.browser.result == 'success' && needs.docker.result == 'success')
+        || github.event_name == 'workflow_dispatch')
     needs: [lint, tests, browser, docker]
     runs-on: ubuntu-latest
     environment: live
@@ -160,7 +144,17 @@ jobs:
         with:
           fetch-depth: 0
           lfs: true
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Require the ref to be in the history of main
+        run: |
+          git fetch -q origin main
+          git merge-base --is-ancestor HEAD origin/main || { echo "::error::$(git rev-parse HEAD) is not in the history of main"; exit 1; }
       - name: Push the snapshot to the live Space
+        id: push
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: ci/sync_space.sh "$HF_SPACE_LIVE" "$GITHUB_SHA"
+        run: ci/sync_space.sh "$HF_SPACE_LIVE" "$(git rev-parse HEAD)"
+      - name: Wait for the live Space to run the snapshot
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: ci/wait_space.sh "$HF_SPACE_LIVE" "${{ steps.push.outputs.snapshot }}"
