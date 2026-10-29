@@ -19,11 +19,11 @@ classifiers = [
 ]
 dependencies = [
     "isotile @ https://github.com/bright-fakl/isotile/archive/c1535fc40cd7e75d59ca45b5ddc4874daf82b87a.zip",
-    "numpy>=1.26",
-    "pandas",
-    "panel>=1.4",
+    "numpy>=2.2",
+    "pandas>=2.3",
+    "panel>=1.9",
     "param>=2.1",
-    "bokeh>=3.4",
+    "bokeh>=3.9",
     "svgwrite>=1.4",
     "matplotlib>=3.9",
 ]
