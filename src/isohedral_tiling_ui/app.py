@@ -15,6 +15,7 @@ from isohedral_tiling_ui.components import (
     LoadSavePanel,
     PreviewStrip,
     PrototileEditor,
+    StatusLine,
     TileTypeSelector,
 )
 from isohedral_tiling_ui.state import TilingState
@@ -53,6 +54,7 @@ main = pn.Column(
         pn.layout.HSpacer(),
         sizing_mode="stretch_width",
     ),
+    pn.Row(pn.layout.HSpacer(), StatusLine(state=state), pn.layout.HSpacer(), sizing_mode="stretch_width"),
     pn.Row(
         pn.layout.HSpacer(),  # Left spacer - expands
         PrototileEditor(state=state),
