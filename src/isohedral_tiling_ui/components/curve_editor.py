@@ -12,7 +12,7 @@ from bokeh.plotting import figure
 from isotile import interpolate
 
 from isohedral_tiling_ui.components.icon_button import icon_button
-from isohedral_tiling_ui.editor_model import editable, preset_availability
+from isohedral_tiling_ui.editor_model import editable, preset_availability, preset_curve
 from isohedral_tiling_ui.utils.curve_presets import get_curve_preset, list_curve_presets
 
 SELECTED_FILL, SELECTED_LINE = "crimson", "#7a0000"
@@ -605,7 +605,11 @@ class CurveEditor(pn.viewable.Viewer):
         if self._preset_reasons.get(preset_name):
             return
         preset_label = preset_name.replace("_", " ")
-        self.state.set_curve(curve_id, get_curve_preset(preset_name), f"Apply '{preset_label}' to curve {curve_id}")
+        self.state.set_curve(
+            curve_id,
+            preset_curve(preset_name, self.state.shape_type(curve_id)),
+            f"Apply '{preset_label}' to curve {curve_id}",
+        )
 
     def _create_preset_icon(self, preset_name: str) -> str:
         pts = get_curve_preset(preset_name)

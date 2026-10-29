@@ -37,14 +37,14 @@ class GalleryPanel(pn.viewable.Viewer):
         for name in sorted(list_presets()):
             tiling = IsohedralTiling.from_preset(name)
             svg = prototile_svg(
-                tiling.prototile(normalized=True), tiling.type.n_vertices, size=38, stroke="#1a5fa0", stroke_width=1.5
+                tiling.prototile(normalized=True), tiling.type.n_vertices, size=34, stroke="#1a5fa0", stroke_width=1.5
             )
             # Format preset name for tooltip
             display_name = name.replace("_", " ").title()
 
             btn = icon_button(
                 svg,
-                38,
+                34,
                 lambda e, n=name: self.state.load_preset(n),
                 width=40,
                 height=40,

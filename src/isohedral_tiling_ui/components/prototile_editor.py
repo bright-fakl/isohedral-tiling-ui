@@ -444,7 +444,7 @@ class PrototileEditor(pn.viewable.Viewer):
             // This is now safe because pd_x/pd_y come from cb_obj.x/y (the raw pan event),
             // not from draggable.data — so overriding the primary creates no circular dependency.
             if (Object.keys(new_positions).length > 0 && primary_dragged >= 0) {
-                const override_primary = snap_active || constrain_active;
+                const override_primary = true;  // the handle sits on the vertex that the parameters allow, not on the cursor
                 const new_x = [...draggable.data.x];
                 const new_y = [...draggable.data.y];
                 for (let i = 0; i < didx.length; i++) {

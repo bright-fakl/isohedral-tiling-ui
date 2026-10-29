@@ -205,6 +205,34 @@ class App:
         )
         time.sleep(0.8)
 
+    def centering(self, tag: str) -> tuple[float, float]:
+        """Offset (x, y) in px of the center of the icon from the center of the box of the button with a tag."""
+        return self.js(
+            """(t) => {
+            const m = [...Bokeh.documents[0].all_models].find(m => m.tags && m.tags.includes(t));
+            const host = Bokeh.index.find_one(m).el, h = host.getBoundingClientRect();
+            const i = host.shadowRoot.querySelector('.bk-SVGIcon').getBoundingClientRect();
+            return [i.x + i.width / 2 - (h.x + h.width / 2), i.y + i.height / 2 - (h.y + h.height / 2)];
+            }""",
+            tag,
+        )
+
+    def vertex_and_outline(self, k: int) -> tuple[list[float], list[float]]:
+        """Position of the k-th movable handle of the prototile editor and of the same vertex in the outline."""
+        d = self.js(
+            """(k) => {
+            const fig = [...Bokeh.documents[0].all_models].find(m => m.type === 'Figure' && m.toolbar.tools.some(
+                t => t.type === 'PointDrawTool' && !t.renderers[0].data_source.data.editable));
+            const d = fig.toolbar.tools.find(t => t.type === 'PointDrawTool').renderers[0].data_source.data;
+            const out = fig.renderers.map(r => r.data_source).find(
+                s => s.data.xs && s.data.xs.length === 1 && s.data.xs[0].length > 4);
+            const i = d.idx[k];
+            return [[d.x[k], d.y[k]], [out.data.xs[0][i], out.data.ys[0][i]]];
+            }""",
+            k,
+        )
+        return d[0], d[1]
+
     def tap_empty(self) -> None:
         nodes = self.curve_nodes()
         self.page.mouse.click(nodes["px"][0] - 30, nodes["py"][0] - 80)
@@ -419,3 +447,48 @@ def test_preset_availability_follows_the_selected_edge(app):
     app.select_curve("C0 (J)")
     app.wait_for(lambda: "scalloped" in app.muted_presets(), True)
     assert "scalloped_down" not in app.muted_presets() and "straight" not in app.muted_presets()
+
+
+def test_icons_are_centered_in_their_buttons(app):
+    app.click_text("Tiling Type")
+    for tag in ["tile:regular_hexagon", "tile:tree", "type:10", "type:41", "preset:scalloped", "preset:straight"]:
+        dx, dy = app.centering(tag)
+        assert abs(dx) < 1.0 and abs(dy) < 1.0, (tag, dx, dy)
+
+
+def test_presets_are_muted_only_where_unavailable(app):
+    from isohedral_tiling_ui.editor_model import preset_availability
+    from isohedral_tiling_ui.state import TilingState
+
+    app.click_text("Tiling Type")
+    for number in (41, 4, 12):  # J edges; S and J edges; U and J edges
+        app.click_model(app.button(f"type:{number}"))
+        app.wait_for(lambda n=str(number): app.marked("type"), [str(number)])
+        state = TilingState()
+        state.load_type(number)
+        for curve_id in state.type_info["customizable_shape_ids"]:
+            if curve_id != state.type_info["customizable_shape_ids"][0]:
+                app.select_curve(f"C{curve_id} ({state.shape_type(curve_id)})")
+            expected = {n for n, reason in preset_availability(state.draft, curve_id).items() if reason}
+            app.wait_for(app.muted_presets, expected)
+            assert expected < set(list_curve_presets())  # not all of them
+
+
+def test_a_dragged_vertex_stays_on_the_vertex_the_parameters_allow(app):
+    app.click_text("Tiling Type")
+    app.click_model(app.button("type:16"))  # one parameter: the vertices cannot follow the cursor freely
+    app.wait_for(lambda: app.marked("type"), ["16"])
+    v = app.vertices()
+    k = 0
+    x, y = v["px"][k], v["py"][k]
+    app.page.mouse.move(x, y)
+    app.page.mouse.down()
+    app.page.mouse.move(x + 20, y - 15, steps=6)
+    app.page.mouse.move(x + 40, y - 30, steps=6)
+    handle, vertex = app.vertex_and_outline(k)  # during the drag
+    assert handle == pytest.approx(vertex, abs=1e-6)
+    n = app.undo_count()
+    app.page.mouse.up()
+    app.wait_for(app.undo_count, n + 1)
+    handle, vertex = app.vertex_and_outline(k)  # after the release
+    assert handle == pytest.approx(vertex, abs=1e-6)

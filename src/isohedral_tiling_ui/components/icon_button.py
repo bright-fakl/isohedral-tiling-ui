@@ -13,9 +13,10 @@ from typing import Any
 import panel as pn
 
 FLAT = """
-.bk-btn { padding: 0 !important; background: transparent !important; border: none !important;
+.bk-btn { min-width: 0 !important; margin: 0 !important; padding: 0 !important; background: transparent !important; border: none !important;
           box-shadow: none !important; width: 100%; height: 100%; display: flex; align-items: center;
           justify-content: center; }
+.bk-SVGIcon { display: flex !important; line-height: 0 !important; align-items: center; justify-content: center; }
 .bk-btn:hover { background: rgba(25, 113, 194, 0.10) !important; }
 """
 

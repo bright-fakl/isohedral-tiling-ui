@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from isotile import IsohedralTiling, get_type, is_symmetric
+from isotile import IsohedralTiling, enforce_symmetry, get_type, is_symmetric
 
 from isohedral_tiling_ui.components import (
     CurveEditor,
@@ -24,8 +24,9 @@ from isohedral_tiling_ui.components import (
     PrototileEditor,
     TileTypeSelector,
 )
-from isohedral_tiling_ui.editor_model import Draft, parameter_groups, preset_availability
+from isohedral_tiling_ui.editor_model import Draft, parameter_groups, preset_availability, preset_curve
 from isohedral_tiling_ui.state import TilingState
+from isohedral_tiling_ui.utils.curve_presets import get_curve_preset
 
 SRC = Path(__file__).parent.parent / "src" / "isohedral_tiling_ui"
 
@@ -402,6 +403,39 @@ def test_preset_availability_follows_the_draft_after_every_change(state):
         state.active_curve_id = curve_id
         status = preset_availability(state.draft, curve_id)
         assert unavailable(editor) == {n for n, reason in status.items() if reason}
+
+
+@pytest.mark.parametrize("shape", ["J", "S", "U"])
+def test_preset_curves_have_the_symmetry_of_the_edge(shape):
+    from isohedral_tiling_ui.utils.curve_presets import get_curve_preset, list_curve_presets
+
+    for name in list_curve_presets():
+        curve = preset_curve(name, shape)
+        assert np.allclose(curve, enforce_symmetry(curve, shape))
+        if shape == "J":
+            assert np.allclose(curve, get_curve_preset(name))
+
+
+def test_preset_curves_for_s_and_u_edges():
+    # the first half of the preset is used; a preset whose first half is straight gives the symmetric part
+    assert preset_curve("scalloped", "U") == pytest.approx(np.array(get_curve_preset("scalloped")))
+    assert preset_curve("scalloped", "S")[1] == pytest.approx([0.25, 0.08])
+    ramp = preset_curve("ramp_up", "S")
+    assert ramp[1] == pytest.approx([0.3, -0.06]) and ramp[2] == pytest.approx([0.7, 0.06])  # not flat
+    assert preset_curve("ramp_up", "U")[1, 1] == pytest.approx(0.06)
+    # nothing for the shape to hold: straight, and reported as unavailable
+    assert np.abs(preset_curve("arrow", "S")[:, 1]).max() == 0
+
+
+def test_presets_without_a_part_that_the_edge_can_hold_are_unavailable(state):
+    editor = CurveEditor(state=state)
+    state.load_type(4)  # edge 0 is an S edge
+    assert state.shape_type(0) == "S"
+    assert {"arrow", "arrow_down"} <= unavailable(editor)
+    assert "symmetry of the S edge" in editor._preset_buttons["arrow"].description
+    assert "ramp_up" not in unavailable(editor)
+    click(editor._preset_buttons["ramp_up"])
+    assert any(y != 0 for _, y in state.draft.curve(0))
 
 
 def test_unavailable_presets_are_not_applied(state):

@@ -458,7 +458,10 @@ def test_preset_availability_agrees_with_committing_the_preset(number):
         draft = Draft.of(number)
         for name, reason in em.preset_availability(draft, sid).items():
             m = EditorModel(draft)
-            curve = em.enforce_symmetry(em.get_curve_preset(name), shape)
+            curve = em.preset_curve(name, shape)
             result = m.commit("x", draft.with_curve(sid, curve))
             changed = m.draft != draft
+            if reason.startswith("the preset has no part"):  # applies as a straight edge
+                assert shape in ("S", "U") and abs(curve[:, 1]).max() == 0
+                continue
             assert (reason == "") == (result.committed and changed), (number, sid, name, reason)
