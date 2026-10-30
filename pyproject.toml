@@ -18,7 +18,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "isotile @ https://github.com/bright-fakl/isotile/archive/c1535fc40cd7e75d59ca45b5ddc4874daf82b87a.zip",
+    "isotile>=0.1.0",
     "numpy>=2.2",
     "pandas>=2.3",
     "panel>=1.9",
@@ -48,9 +48,6 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-
-[tool.hatch.metadata]
-allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/isohedral_tiling_ui"]
